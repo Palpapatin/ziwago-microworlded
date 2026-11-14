@@ -1,0 +1,35 @@
+data/wikitext-103-raw/
+data/
+/data/
+
+# Python caches and test artifacts
+__pycache__/
+*.py[cod]
+.ipynb_checkpoints/
+/.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# Local environments and build outputs
+.venv/
+venv/
+.tox/
+build/
+dist/
+*.egg-info/
+
+# Local run outputs, logs, and model checkpoints
+.zwork/
+Produce/
+*.log
+*.pt
+*.pth
+*.ckpt
+*.safetensors
+
+# Local credentials
+.env
+.env.*
+!.env.example

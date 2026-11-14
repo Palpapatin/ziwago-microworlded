@@ -1,0 +1,1 @@
+"""cognition — слой L3: язык, память, маршрутизация (ARCHITECTURE_MAPPING §7)."""
