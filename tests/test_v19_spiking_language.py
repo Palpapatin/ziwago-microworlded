@@ -397,6 +397,10 @@ class V19Tests(unittest.TestCase):
             restored.load_self_contained_checkpoint(path)
             self.assertIs(restored.external_grounding_verifier_fn, hook)
             self.assert_tree_equal(core.export_runtime_state(), restored.export_runtime_state())
+            generated = restored.pure_neural_generate_response(
+                "What sensory signals?", max_tokens=8, enable_active_inference=False)
+            self.assertIn("pure_weight_generated_response", generated)
+            self.assertTrue(str(generated["pure_weight_generated_response"]).strip())
 
     def test_external_grounding_hook_is_mandatory_and_fail_closed(self):
         core = tiny_core()

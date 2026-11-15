@@ -269,3 +269,25 @@ python tools/limited_run.py --ram-pct 55 --cpu-pct 50 --log D:\...\run.log -- py
 
 Дифф `MODULE_MAP_TABLE_2026-11-13.md` — обязательная часть регрессии: переход
 файла или механизма в DEAD/OFF/PHANTOM-EFFECT виден глазами.
+
+### 8.2 Новое поле в живом объекте = миграция при восстановлении (15.11.2026)
+
+Восстановление ставит только те поля, что были в снимке. Любое новое поле,
+добавленное в живой объект ПОСЛЕ этого чекпоинта, в снимке отсутствует — и
+модель падала три раза подряд, пока это не закрыли:
+
+| Симптом | Причина | Закрыто |
+|---|---|---|
+| `AttributeError: 'CorticalColumn' object has no attribute 'astrocyte'` | трек O (14.11) добавил астроцит в колонку | ленивое создание `CorticalColumn._ensure_astrocyte()` |
+| `ValueError: ach must be in [0.0, 2.0]` | в кандидате v19 `ach=11.56` при номинальном ~0.4; кламп был только в `update()`, не в restore | `NeuroChemistry.normalize_restored_state()` + отчёт |
+| `ValueError: Invalid action context or evidence` | резонанс CA3 у обученной модели до 2.5 → `(1-resonance)*0.5` уходил в минус | `ZiwagoBiologicalSNNAssistant._action_evidence()` |
+
+Правило: новое поле ⇒ (а) ленивое создание или (б) пункт в
+`ZiwagoPureSynapticDialogueOrganismV14.apply_restore_migrations()` — единой
+точке после восстановления, которая пишет ОТЧЁТ в `restore_migrations`.
+Миграция без отчёта = «тихое» изменение поведения модели.
+
+Рекомендация: любая правка, добавляющая поле живому объекту, обязана
+проходить проверку восстановлением СТАРОГО чекпоинта
+(`ziwago_v19_bankfixed_20261109.pt`) и генерацией — иначе модель молча
+перестаёт отвечать.

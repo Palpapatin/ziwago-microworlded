@@ -49,6 +49,43 @@ class ChemState:
 class NeuroChemistry:
     """Скалярные модуляторы с биологическими τ."""
 
+    # Границы осей химии — ТЕ ЖЕ, что применяются в update(). Восстановленный
+    # из старого чекпоинта v19 аккумулятор может лежать вне них (ach=11.56 при
+    # номинальном ~0.4): без нормализации потребители (валидатор
+    # action-контекста, модуляторные гейты) падают, и модель не отвечает ни
+    # на что. Поэтому границы живут здесь, а не разбросаны по потребителям.
+    STATE_BOUNDS: Dict[str, tuple] = {
+        "da": (0.0, 2.0), "ne": (0.0, 2.0), "ach": (0.0, 2.0),
+        "ht": (0.0, 2.0), "cort": (0.0, 2.0),
+        "ado": (0.0, 1.0), "ox": (0.0, 1.0), "lactate": (0.0, 1.0),
+        "ecb": (0.0, 1.2),
+    }
+
+    def normalize_restored_state(self) -> Dict[str, Dict[str, float]]:
+        """Привести восстановленное состояние к допустимым границам.
+
+        Возвращает отчёт по каждой оси, которую пришлось ограничить (пустой
+        словарь — состояние уже было в границах). Миграция обязана быть
+        ВИДИМОЙ: иначе «тихое» ограничение состояния меняет поведение
+        модели без следа.
+        """
+        import math as _math
+        report: Dict[str, Dict[str, float]] = {}
+        for name, (low, high) in self.STATE_BOUNDS.items():
+            try:
+                raw = float(getattr(self.s, name))
+            except (AttributeError, TypeError, ValueError):
+                continue
+            if not _math.isfinite(raw):
+                clamped = low
+            else:
+                clamped = min(high, max(low, raw))
+            if clamped != raw:
+                setattr(self.s, name, clamped)
+                report[name] = {"raw": raw, "clamped": clamped,
+                                "low": low, "high": high}
+        return report
+
     def __init__(self, cfg: ChemistryCfg):
         self.cfg = cfg
         self.s = ChemState()

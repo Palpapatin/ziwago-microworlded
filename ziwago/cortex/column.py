@@ -103,8 +103,7 @@ class CorticalColumn:
         from .astrocyte import AstrocyteMicrodomain
         self.dendrite = DendriticTree(n, n_in, n_branch=7, seed=seed + 3)
         self.astrocyte = AstrocyteMicrodomain(n, tau_ca=2500.0, gamma_gli=0.65,
-                                            theta_ca=0.20, diffusion=0.05, ne_boost=1.5)
-        # D3 (archnext.txt): O(1) Локальный оценщик критичности колонки без глобального readout
+                                            theta_ca=0.20, diffusion=0.05, ne_boost=1.5)        # D3 (archnext.txt): O(1) Локальный оценщик критичности колонки без глобального readout
         self.local_sigma: float = 0.97
         self._loc_act_mean: float = 0.06
         self._loc_act_prev1: float = 0.06
@@ -157,6 +156,24 @@ class CorticalColumn:
             syn.advance_time(dt=1.0, s_pre=pre, s_post=s_post)
 
     # ------------------------------------------------------------------
+    def _ensure_astrocyte(self):
+        """Астроцит создаётся ЛЕНИВО и всегда доступен.
+
+        Восстановление старого чекпоинта не знает про новые поля: снимок
+        v19 не содержит `astrocyte`, и код падал с
+        `AttributeError: 'CorticalColumn' object has no attribute 'astrocyte'`
+        на каждом шаге — то есть модель не отвечала ни на что. Ленивое
+        создание чинит это и для любых будущих новых полей колонки.
+        """
+        astro = getattr(self, "astrocyte", None)
+        if astro is None:
+            from .astrocyte import AstrocyteMicrodomain
+            n = int(getattr(self.zcfg, "n_neurons", 0) or getattr(self.pyr, "n", 1))
+            astro = AstrocyteMicrodomain(n, tau_ca=2500.0, gamma_gli=0.65,
+                                        theta_ca=0.20, diffusion=0.05, ne_boost=1.5)
+            self.astrocyte = astro
+        return astro
+
     def step(self, x_ff: torch.Tensor, x_fb: torch.Tensor,
              f_mod: float, vip_mod: float,
              ltp_field: Optional[torch.Tensor] = None,
@@ -300,12 +317,13 @@ class CorticalColumn:
         self._last_x_ff = x_ff.detach()
         self._last_x_fb = x_fb.detach()
 
-        astro_gate = self.astrocyte.step(out.s, ne=ne_val)
+        astro = self._ensure_astrocyte()
+        astro_gate = astro.step(out.s, ne=ne_val)
         astro_gain = float(astro_gate.mean().item())
         for syn in (self.w_ff, self.w_fb, self.w_rec):
             syn.set_stp_gain(astro_gain)
         if hasattr(self.dendrite, "apply_theta_ca_shift"):
-            self.dendrite.apply_theta_ca_shift(self.astrocyte.theta_ca_shift())
+            self.dendrite.apply_theta_ca_shift(astro.theta_ca_shift())
 
         # --- D3 (archnext.txt): O(1) Локальная оценка критичности колонки без глобального readout ---
         # Использует 2-лаговую экспоненциальную автоковариацию (Local MR Estimator, Wilting & Priesemann 2018)

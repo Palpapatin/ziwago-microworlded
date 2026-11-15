@@ -20,6 +20,7 @@ class IntegrationConfig:
     replay_capacity: int = 128
     replay_interval_ms: int = 40
     replay_transfer: float = 0.1
+    meta_replay_priority_enabled: bool = True
     broadcast_gain: float = 0.15
     higher_order_gain: float = 0.1
     baseline_load: float = 0.05
@@ -56,6 +57,8 @@ class IntegrationConfig:
     hippo_novelty_da_gain: float = 0.5
 
     def __post_init__(self):
+        if not isinstance(self.meta_replay_priority_enabled, bool):
+            raise ValueError("meta_replay_priority_enabled must be a boolean")
         for name in ("ticks_per_token", "max_step_ticks", "max_sleep_ticks", "replay_capacity",
                      "replay_interval_ms", "decision_budget_ms", "criticality_window"):
             value = getattr(self, name)
@@ -133,6 +136,11 @@ class IntegratedOrganism:
         self.ast_priority = torch.full((n_input,), 0.5)
         self.confidence = 0.5
         self.replay = []
+        self._meta_replay_priority_pending = 0.0
+        self._meta_replay_priority_for_credit = 0.0
+        self._last_meta_replay_priority_output = 0.0
+        self._last_meta_replay_priority_applied = 0.0
+        self.meta_replay_priority_credit_count = 0
         self.replay_evictions = 0
         self.replay_events = 0
         self.replay_synapses = 0
@@ -230,6 +238,7 @@ class IntegratedOrganism:
         x = x.detach().float().flatten()
         if x.numel() != self.n_input or not bool(torch.isfinite(x).all()):
             raise ValueError("Sensory input must be a finite vector of the configured width")
+        self._begin_meta_replay_priority_tick()
         chem = core.chemistry
         old_phase = chem.phase
         bundle = chem.advance(self.previous_load, ca_mean=self.previous_ca,
@@ -313,6 +322,7 @@ class IntegratedOrganism:
         self.broadcast = (gw.broadcast.detach().clone() if gw.ignition > 0.5
                           else torch.zeros_like(self.broadcast))
         meta = son.meta_head.step(self.broadcast, gw.content, self.previous_error, learn=plastic)
+        self._stage_meta_replay_priority(meta)
         son.meta_head.err_hist = son.meta_head.err_hist[-self.cfg.criticality_window:]
         son.meta_head.conf_hist = son.meta_head.conf_hist[-self.cfg.criticality_window:]
         self.confidence = meta.confidence
@@ -355,6 +365,8 @@ class IntegratedOrganism:
                           # Энергия GW честно считается, но наружу НЕ отдавалась —
                           # ещё один «призрак»: значение было, а потребителя не было.
                           "gw_energy": float(gw.energy),
+                          "meta_replay_priority": self._last_meta_replay_priority_output,
+                          "meta_replay_priority_for_credit": self._meta_replay_priority_for_credit,
                           "replay": replay_item is not None, "action": dict(self.action_result)}
         out.spike_count_window = torch.tensor([counts])
         return out
@@ -578,9 +590,18 @@ class IntegratedOrganism:
         if len(self.replay) >= self.cfg.replay_capacity:
             self.replay.pop(0)
             self.replay_evictions += 1
-        self.replay.append({"cue": cue.detach().clone(), "priority": float(loss) + 1.0 - self.confidence,
+        base_priority = float(loss) + 1.0 - self.confidence
+        meta_priority = (self._meta_replay_priority_for_credit
+                         if self.cfg.meta_replay_priority_enabled else 0.0)
+        self.replay.append({"cue": cue.detach().clone(),
+                            "priority": base_priority + meta_priority,
+                            "base_priority": base_priority,
+                            "meta_replay_priority": meta_priority,
                             "columns": [{"id": cid, "pre": core.moe_cortex.columns[cid]._last_x_ff.detach().clone().flatten()}
                                         for cid in cortical_out.active_expert_ids]})
+        self._last_meta_replay_priority_applied = meta_priority
+        if self.cfg.meta_replay_priority_enabled:
+            self.meta_replay_priority_credit_count += 1
         if self.hippo is not None and self._last_hippo is not None:
             h = self._last_hippo.hippo
             self.hippo.store_episode(h.ec, h.dg, h.ca3, error=float(loss),
@@ -603,10 +624,24 @@ class IntegratedOrganism:
         return result
 
     def telemetry(self, core):
+        reflection = getattr(core.son_column, "organism_reflection", {})
+        recent_meta = reflection.get("meta") if isinstance(reflection, dict) else None
         return {"config": asdict(self.cfg), "physiology": core.chemistry.telemetry(),
                 "last_tick": dict(self.last_tick), "action": self.actions.telemetry(),
                 "replay_pending": len(self.replay), "replay_events": self.replay_events,
                 "replay_synapses": self.replay_synapses, "replay_evictions": self.replay_evictions,
+                "meta_replay_priority": {
+                    "enabled": self.cfg.meta_replay_priority_enabled,
+                    "consumer": "IntegratedOrganism.record_credit",
+                    "delay_ticks": 1,
+                    "pending_for_next_tick": self._meta_replay_priority_pending,
+                    "applied_to_credit": self._last_meta_replay_priority_applied,
+                    "credit_count": self.meta_replay_priority_credit_count,
+                },
+                "meta_head": core.son_column.meta_head.telemetry(
+                    recent=recent_meta,
+                    replay_priority_connected=self.cfg.meta_replay_priority_enabled),
+                "global_workspace": dict(core.son_column.gw.telemetry),
                 "reward_events": self.reward_events, "criticality": dict(self.criticality),
                 "homeostasis": {"enabled": self.cfg.criticality_control_enabled,
                                 **self.homeostatic_status},
@@ -617,3 +652,22 @@ class IntegratedOrganism:
                 "dual_hippocampus": self._hippo_telemetry(),
                 "phase_events": list(self.phase_events),
                 "energy_accounting": "normalized cortical currents, spikes and somatic drive; not biochemical ATP units"}
+
+    def _begin_meta_replay_priority_tick(self):
+        """Latch the previous tick's MetaHead output for the next credit."""
+        self._meta_replay_priority_for_credit = (
+            self._meta_replay_priority_pending
+            if self.cfg.meta_replay_priority_enabled else 0.0
+        )
+
+    def _stage_meta_replay_priority(self, meta):
+        """Stage only replay_priority; other MetaHead gates remain unconsumed."""
+        if not self.cfg.meta_replay_priority_enabled:
+            self._meta_replay_priority_pending = 0.0
+            self._last_meta_replay_priority_output = 0.0
+            return
+        priority = float(meta.gates["replay_priority"])
+        if not math.isfinite(priority) or priority < 0.0:
+            raise ValueError("MetaHead replay_priority must be finite and non-negative")
+        self._meta_replay_priority_pending = priority
+        self._last_meta_replay_priority_output = priority

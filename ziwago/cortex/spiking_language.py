@@ -172,8 +172,13 @@ class SpikingLanguageLoop:
     def export_state_dict(self) -> Dict[str, object]:
         return export_runtime_tree({k: v for k, v in vars(self).items() if k != "moe_cortex"})
 
-    def load_state_dict(self, state: Dict[str, object]) -> None:
-        restored = load_runtime_tree({k: v for k, v in vars(self).items() if k != "moe_cortex"}, state)
+    def load_state_dict(self, state: Dict[str, object],
+                        remove_missing_attributes: bool = False) -> None:
+        restored = load_runtime_tree(
+            {k: v for k, v in vars(self).items() if k != "moe_cortex"},
+            state,
+            _remove_missing_attributes=remove_missing_attributes,
+        )
         for key in list(vars(self)):
             if key != "moe_cortex" and key not in restored and not callable(getattr(self, key)):
                 delattr(self, key)

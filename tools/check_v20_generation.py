@@ -74,6 +74,7 @@ def run_version(version: int, rows: list[dict]) -> dict:
         prompt = str(row["prompt"])
         reference = str(row["response"])
         t0 = time.perf_counter()
+        answer: dict = {}
         try:
             answer = assistant.chat(prompt, max_tokens=window)
             text = str(answer.get("pure_weight_generated_response", ""))
@@ -81,7 +82,12 @@ def run_version(version: int, rows: list[dict]) -> dict:
             finish = str(answer.get("finish_reason", ""))
             action = str(answer.get("basal_ganglia_selected_action", ""))
         except Exception as exc:                    # noqa: BLE001
+            # Ответ-объект может остаться неполным: метрики ниже читаются из
+            # `answer`, поэтому он должен существовать всегда (иначе прибор
+            # падал бы, скрывая исходную ошибку генерации).
             text, kind, finish, action = f"<EXCEPTION {type(exc).__name__}: {exc}>", "error", "error", ""
+            answer = dict(answer or {})
+            answer.setdefault("chat_exception", f"{type(exc).__name__}: {exc}")
         hit = text.strip() == reference.strip()
         exact += int(hit)
         stopped += int(bool(answer.get("stopped_by_learned_eos")))

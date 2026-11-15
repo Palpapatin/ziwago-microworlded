@@ -22,6 +22,7 @@ dist/
 
 # Local run outputs, logs, and model checkpoints
 .zwork/
+/.delta/
 Produce/
 *.log
 *.pt

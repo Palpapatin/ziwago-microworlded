@@ -95,6 +95,34 @@ class FlatV20Tests(unittest.TestCase):
         rep = flat.sleep_cycle(wave_idx=0)
         self.assertIsInstance(rep, dict)
 
+    def test_nrem_to_rem_reports_swr_disabled_without_cortical_writer(self):
+        from ziwago.config import HippocampusCfg
+        from ziwago.memory.hippocampus import Hippocampus
+
+        flat = build_flat(integrated=True)
+        core, life = flat.core_organism, flat.core_organism.life
+        hippo = Hippocampus(HippocampusCfg(n_ec=16, n_dg=48, n_ca3=64), seed=23)
+        for seed in (71, 72, 73):
+            ec = torch.randn(1, hippo.cfg.n_ec, generator=torch.Generator().manual_seed(seed))
+            dg = hippo.dg_code(ec)
+            ca3 = torch.relu(dg @ hippo.w_dg_ca3.t())
+            hippo.store_episode(ec, dg, ca3, error=0.8, uncertainty=0.3)
+        life.hippo = hippo
+        core.chemistry.s.ado = 0.9
+        core.chemistry.s.ach = 0.2
+
+        with mock.patch.object(hippo, "swr_replay", wraps=hippo.swr_replay) as swr_replay:
+            flat._on_sleep_phase("awake", "nrem")
+            flat._on_sleep_phase("nrem", "rem")
+
+        swr_replay.assert_not_called()
+        swr = life.sleep_report["hippocampus_sleep"]
+        self.assertFalse(swr["swr_gate_open"])
+        self.assertFalse(swr["swr_cortical_write_connected"])
+        self.assertEqual(swr["swr_skipped_reason"], "no_cortical_write")
+        self.assertEqual(swr["replayed"], [])
+        self.assertIn("semantic_bridges", swr["rem"])
+
     def test_action_and_reward_v20(self):
         flat = build_flat(integrated=True)
         ctx = torch.ones(64) * 0.1

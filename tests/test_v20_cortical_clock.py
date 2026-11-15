@@ -3,6 +3,7 @@ from copy import deepcopy
 import math
 from pathlib import Path
 import sys
+from types import SimpleNamespace
 from unittest.mock import patch
 
 import pytest
@@ -14,6 +15,7 @@ if str(ROOT) not in sys.path:
 
 from ziwago.config import USSynapseCfg
 from ziwago.core.synapse import GenesisSynapse
+from ziwago.cortex import moe_cortex as runtime_paths
 from ziwago.cortex.moe_cortex import SparselyGatedCorticalMoE
 
 
@@ -67,6 +69,106 @@ def _assert_tree_equal(a, b):
             _assert_tree_equal(left, right)
     else:
         assert a == b
+
+
+def test_het_syn_matrices_are_allocated_only_when_the_feature_is_used():
+    syn = _syn(n_pre=4, n_post=3)
+    assert not hasattr(syn, "tau_syn_het")
+    assert not hasattr(syn, "het_trace")
+
+    syn.advance_time(dt=1.0, s_pre=torch.ones(1, 4), s_post=torch.zeros(1, 3))
+    assert not hasattr(syn, "tau_syn_het")
+    assert not hasattr(syn, "het_trace")
+
+    syn.enable_het_syn = True
+    trace = syn.step_het_syn_traces(torch.ones(1, 4), adapt_tau=False)
+    assert syn.tau_syn_het.shape == (3, 4)
+    assert syn.het_trace.shape == (3, 4)
+    assert torch.isfinite(syn.tau_syn_het).all()
+    assert torch.isfinite(trace).all()
+
+
+def test_slow_weight_initialization_matches_the_original_seeded_values():
+    n_pre, n_post, seed, init_scale = 7, 5, 23, 0.4
+    cfg = USSynapseCfg(density=0.6)
+    generator = torch.Generator().manual_seed(seed)
+    expected_mask = torch.rand(n_post, n_pre, generator=generator) < cfg.density
+    expected_weights = (
+        torch.rand(n_post, n_pre, generator=generator) * init_scale - init_scale / 2.0
+    ) * (1.0 if cfg.sign == "exc" else -1.0) * expected_mask
+
+    syn = GenesisSynapse(n_pre, n_post, cfg, seed=seed, init_scale=init_scale)
+    assert torch.equal(syn.mask, expected_mask)
+    assert torch.equal(syn.w_slow, expected_weights)
+
+
+def test_branch_kernels_are_shared_for_matching_dimensions():
+    first = _syn(n_pre=4, n_post=3)
+    second = GenesisSynapse(4, 2, USSynapseCfg(density=1.0), name="other", seed=21)
+    idx = torch.arange(4, dtype=torch.float32)
+    dist = (idx[:, None] - idx[None, :]).abs()
+    expected = torch.exp(-0.5 * (dist / 1.5) ** 2)
+    expected.fill_diagonal_(0.0)
+    expected = expected / expected.sum(dim=1, keepdim=True).clamp(min=1e-6)
+
+    assert first.branch_kernel is second.branch_kernel
+    torch.testing.assert_close(first.branch_kernel, expected, rtol=0.0, atol=0.0)
+
+
+def test_pinned_block_mask_is_allocated_only_when_lanes_are_pinned():
+    syn = _syn()
+    assert not hasattr(syn, "pinned_block_mask")
+
+    syn.enable_scaffold = True
+    syn.learn(
+        error=torch.ones(1, 1),
+        s_pre=torch.ones(1, 2),
+        s_post=torch.ones(1, 1),
+        f_mod=1.0,
+    )
+    assert not hasattr(syn, "pinned_block_mask")
+
+    syn.pin_top_block_sparse_lanes()
+    assert syn.pinned_block_mask.shape == syn.mask.shape
+
+
+def test_active_sparse_driver_matches_dense_projection_without_cached_indices():
+    syn = GenesisSynapse(4, 3, USSynapseCfg(density=1.0), seed=12)
+    syn.enable_block_sparse = True
+    syn.w_slow.copy_(torch.arange(12, dtype=torch.float32).reshape(3, 4) / 10.0)
+    syn.w_fast.fill_(0.1)
+    syn.u_syn.fill_(0.8)
+    x = torch.tensor([[1.0, 0.0, 0.5, 0.0], [0.0, 0.0, 0.0, 0.0]])
+    effective_weights = (syn.w_slow + syn.w_fast) * syn.mask * syn.u_syn
+
+    actual = syn.drive(x)
+    expected = x @ effective_weights.t()
+
+    torch.testing.assert_close(actual, expected)
+    for field in ("csr_row_ptr", "csr_col_idx", "csc_col_ptr", "csc_row_idx", "_dirty_blocks"):
+        assert not hasattr(syn, field)
+
+
+def test_dynamic_state_export_round_trips_without_sparse_index_cache():
+    cortex = _moe()
+    state = cortex.export_dynamic_state_dict()
+
+    cortex.load_dynamic_state_dict(state)
+
+    for column in cortex.columns:
+        for syn in (column.w_ff, column.w_fb, column.w_rec):
+            assert not hasattr(syn, "_dirty_blocks")
+
+
+def test_epoch_kl_snapshot_is_explicit_and_still_measures_weight_drift():
+    syn = _syn()
+    assert not hasattr(syn, "w_epoch0_snapshot")
+    with pytest.raises(RuntimeError, match="Capture the epoch-0"):
+        syn.kl_divergence_bits()
+
+    syn.capture_epoch0_snapshot()
+    syn.w_slow[0, 0] = 1.0
+    assert syn.kl_divergence_bits() > 0.0
 
 
 @pytest.mark.parametrize("fault", ["tick", "dt"])

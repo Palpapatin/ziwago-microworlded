@@ -13,6 +13,7 @@ if str(ROOT) not in sys.path:
 from ziwago.core.criticality import CriticalityMonitor
 from ziwago.core.interoception import InteroceptiveField
 from ziwago.core.sdr import HashedCorticalSDREncoder, LCASparseEncoder
+from ziwago.cortex.next16_core import FusiZenkeCascadeMetaplasticityShield
 
 
 class TautologyGuardTests(unittest.TestCase):
@@ -56,6 +57,13 @@ class TautologyGuardTests(unittest.TestCase):
         for cls in (CriticalityMonitor, InteroceptiveField, LCASparseEncoder, HashedCorticalSDREncoder):
             hints = get_type_hints(cls)
             self.assertIsInstance(hints, dict)
+
+    def test_metaplasticity_shield_method_annotations_resolve(self):
+        for method in (
+            FusiZenkeCascadeMetaplasticityShield.stats,
+            FusiZenkeCascadeMetaplasticityShield.decay_trace,
+        ):
+            self.assertIn("return", get_type_hints(method))
 
 
 if __name__ == "__main__":

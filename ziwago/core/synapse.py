@@ -20,6 +20,8 @@ Eligibility-экспонента: z_pre/z_post — O(N) следы (Izhikevich 2
 from __future__ import annotations
 
 from dataclasses import dataclass
+from functools import lru_cache
+import hashlib
 import heapq
 import math
 from typing import Dict, List, Optional, Tuple
@@ -58,6 +60,15 @@ SCAFFOLD_SOFT: int = 1      # Незрелая PNN: ограничение ск�
 SCAFFOLD_HARD: int = 2      # Грибовидные шипики + зрелая PNN: Δw = 0, иммунитет к забыванию и прунингу
 
 
+@lru_cache(maxsize=8)
+def _branch_kernel(n_pre: int) -> torch.Tensor:
+    idx = torch.arange(n_pre, dtype=torch.float32)
+    dist = (idx[:, None] - idx[None, :]).abs()
+    kernel = torch.exp(-0.5 * (dist / 1.5) ** 2)
+    kernel.fill_diagonal_(0.0)
+    return kernel / kernel.sum(dim=1, keepdim=True).clamp(min=1e-6)
+
+
 @dataclass
 class SynOut:
     w_mean: float
@@ -77,10 +88,9 @@ class GenesisSynapse:
         self.n_pre, self.n_post = n_pre, n_post
         g = torch.Generator().manual_seed(seed)
         self.mask = (torch.rand(n_post, n_pre, generator=g) < cfg.density)
-        w_init = (torch.rand(n_post, n_pre, generator=g) * init_scale
-                  - init_scale / 2.0) \
-            * (1.0 if cfg.sign == "exc" else -1.0)
-        self.w_slow = w_init * self.mask
+        self.w_slow = torch.rand(n_post, n_pre, generator=g)
+        self.w_slow.mul_(init_scale).sub_(init_scale / 2.0)
+        self.w_slow.mul_(1.0 if cfg.sign == "exc" else -1.0).mul_(self.mask)
         self.w_fast = torch.zeros(n_post, n_pre)
         # Целевая L2-норма строки для гомеостаза Тёрриджано (сохранение масштаба)
         self.target_row_norm = self.w_slow.norm(dim=1, keepdim=True).clamp(min=0.25)
@@ -99,13 +109,9 @@ class GenesisSynapse:
         self.u_syn = torch.ones(n_post, n_pre)  # ресурс депрессии (SOC)
         self.stp_gain = 1.0          # изменяемое состояние астроцитарного гейта
         # Ядро внутриветочного дендритного соседства (Уровень 1: кластерная гетеро-STDP)
-        idx = torch.arange(n_pre, dtype=torch.float32)
-        dist = (idx[:, None] - idx[None, :]).abs()
-        k_branch = torch.exp(-0.5 * (dist / 1.5) ** 2)
-        k_branch.fill_diagonal_(0.0)
-        self.branch_kernel = k_branch / k_branch.sum(dim=1, keepdim=True).clamp(min=1e-6)
+        self.branch_kernel = _branch_kernel(n_pre)
         self.spine_age = torch.zeros(n_post, n_pre)  # возраст шипиков (для прунинга)
-        self.spine_health = torch.ones(n_post, n_pre) * self.mask.float() * 0.5  # актиновый каркас H_ij
+        self.spine_health = self.mask.to(dtype=torch.float32).mul_(0.5)  # актиновый каркас H_ij
         self.last_hetero_ltd: float = 0.0
         self.last_pruned: int = 0
         self.last_sprouted: int = 0
@@ -137,20 +143,10 @@ class GenesisSynapse:
         self.crossover_density: float = 0.50
         self.gpu_arch_profile: str = "ampere"  # 'volta' (0.40) или 'ampere' (0.50) по F#66 / F#65
         self.last_block_emptiness_ratio: float = 0.0
-        self.pinned_block_mask = torch.zeros((n_post, n_pre), dtype=torch.bool)
         self.is_sleep_phase: bool = False
-        self._dirty_blocks = torch.zeros(
-            ((n_post + 15) // 16, (n_pre + 15) // 16), dtype=torch.bool
-        )
         self.last_flop_efficiency: float = 1.0
         self.cum_useful_macs: float = 0.0
         self.cum_issued_macs: float = 0.0
-        # Структуры SparseProp: CSR-списки исходящих синапсов для каждого пре-нейрона j -> {i}
-        # и очередь с приоритетом (Min-Heap) постсинаптических состояний для O(K log N) сложности
-        self.csr_row_ptr = torch.zeros(n_pre + 1, dtype=torch.long)
-        self.csr_col_idx = torch.zeros(0, dtype=torch.long)
-        self.csc_col_ptr = torch.zeros(n_post + 1, dtype=torch.long)
-        self.csc_row_idx = torch.zeros(0, dtype=torch.long)
         self.sparseprop_heap: List[Tuple[float, int]] = []
         self.last_sparseprop_complexity_ops: float = 0.0
         self.last_dense_complexity_ops: float = float(n_pre * n_post)
@@ -160,37 +156,12 @@ class GenesisSynapse:
         # по кортикальным данным Allen Institute (с отсечением хвоста < 1.0 мс, F#54) и адаптируемую
         # к реальной временно́й статистике межспайковых интервалов входного потока (F#55)!
         self.enable_het_syn: bool = False
-        log_mu = math.log(max(2.0, float(cfg.tau_x)))
-        log_std = 0.85
-        raw_lognorm = torch.exp(log_mu + log_std * torch.randn(n_post, n_pre, generator=g))
-        self.tau_syn_het = raw_lognorm.clamp(min=1.0, max=5000.0)
-        self.het_trace = torch.zeros(n_post, n_pre)
+        # Dense HetSyn matrices are materialized only when this opt-in path is used.
         self.pre_isi_ema = torch.full((n_pre,), float(cfg.tau_x))
         self.pre_silence_ticks = torch.zeros(n_pre)
 
         # --- Lab.html F#58 (accepted on P7) & F#43 / F#49 (on P8): Термодинамический порог и KL-Custody ---
         self.readout_approx_noise_floor: float = 0.0
-        self.w_epoch0_snapshot = self.w_slow.clone()
-        self._rebuild_sparseprop_index()
-
-    def _rebuild_sparseprop_index(self) -> None:
-        """Перестраивает разреженные списки смежности SparseProp (arxiv 2312.17216):
-        1) CSR по пресинаптическим столбцам (j -> список пост-нейронов i) для прямого распространения спайков;
-        2) CSC по постсинаптическим строкам (i -> список пре-нейронов j) для обратного распространения спайков/ошибки."""
-        # Прямой индекс: для каждого pre j храним активные post i
-        mask_t = self.mask.t()  # [n_pre, n_post]
-        counts_pre = mask_t.sum(dim=1).to(torch.long)
-        self.csr_row_ptr = torch.zeros(self.n_pre + 1, dtype=torch.long, device=self.mask.device)
-        self.csr_row_ptr[1:] = torch.cumsum(counts_pre, dim=0)
-        nz_pre = torch.nonzero(mask_t, as_tuple=False)
-        self.csr_col_idx = nz_pre[:, 1].contiguous() if nz_pre.numel() > 0 else torch.zeros(0, dtype=torch.long, device=self.mask.device)
-
-        # Обратный индекс: для каждого post i храним активные pre j
-        counts_post = self.mask.sum(dim=1).to(torch.long)
-        self.csc_col_ptr = torch.zeros(self.n_post + 1, dtype=torch.long, device=self.mask.device)
-        self.csc_col_ptr[1:] = torch.cumsum(counts_post, dim=0)
-        nz_post = torch.nonzero(self.mask, as_tuple=False)
-        self.csc_row_idx = nz_post[:, 1].contiguous() if nz_post.numel() > 0 else torch.zeros(0, dtype=torch.long, device=self.mask.device)
 
     @property
     def w(self) -> torch.Tensor:
@@ -246,19 +217,7 @@ class GenesisSynapse:
 
     def drive_pdsr(self, x: torch.Tensor,
                    apical_subspace_hint: Optional[torch.Tensor] = None) -> torch.Tensor:
-        """Алгоритм SparseProp (Engelken 2023, arxiv 2312.17216; next9.txt #1):
-        Событийное прямое распространение спайков в разреженных блоках со сложностью O(K log N)
-        вместо плотного O(N^2) опроса молчащих нейронов.
-
-        1. Находит активные пресинаптические спайки S_pre = {j : |x_j| > 0}.
-        2. Обходит только исходящие CSR-списки активных пре-нейронов (csr_row_ptr[j]..csr_row_ptr[j+1])
-           внутри предиктивно открытых постсинаптических блоков (apical_subspace_hint).
-        3. Обновляет очередь с приоритетом (Min-Heap `sparseprop_heap`, ключ = время до спайка / -|I_post|),
-           обеспечивая O(K log N) сложность и FLOP-эффективность >= 0.80 при нулевой погрешности.
-        """
-        if bool(self._dirty_blocks.any()) or self.csr_row_ptr.numel() != self.n_pre + 1:
-            self._rebuild_sparseprop_index()
-            self._dirty_blocks.zero_()
+        """Propagate through active input columns and open output rows."""
 
         w_eff = (self.w_slow + self.w_fast) * self.mask * self.u_syn * self.stp_gain
         x2d = x.unsqueeze(0) if x.dim() == 1 else x
@@ -323,7 +282,7 @@ class GenesisSynapse:
         self.cum_issued_macs += issued_ops
         self.last_flop_efficiency = min(1.0, self.cum_useful_macs / max(1.0, self.cum_issued_macs))
 
-        # 4. Событийное распространение SparseProp по CSR-спискам активных пре-нейронов
+        # 4. Project only active input columns and open output rows.
         idx_pre = torch.nonzero(act_pre_cols, as_tuple=False).flatten()
         idx_post = torch.nonzero(post_open, as_tuple=False).flatten()
         w_sub = w_eff.index_select(0, idx_post).index_select(1, idx_pre)
@@ -350,6 +309,7 @@ class GenesisSynapse:
             trace[i, j] = exp(-dt / tau[i, j]) * trace[i, j] + input_spike[j]
         и при adapt_tau=True локально адаптирует распределение τ_ij под фактическую статистику
         межспайковых интервалов входного потока (F#55), предотвращая схлопывание шкал времени."""
+        self._ensure_het_syn_state()
         x = s_pre.detach().mean(0) if s_pre.dim() > 1 else s_pre.detach()
         fired = (x > 1e-5)
         self.pre_silence_ticks = self.pre_silence_ticks + dt
@@ -363,6 +323,19 @@ class GenesisSynapse:
         decay_mat = torch.exp(-float(dt) / self.tau_syn_het)
         self.het_trace = (self.het_trace * decay_mat + x.unsqueeze(0)) * self.mask.float()
         return self.het_trace
+
+    def _ensure_het_syn_state(self) -> None:
+        if hasattr(self, "tau_syn_het") and hasattr(self, "het_trace"):
+            return
+        seed = int.from_bytes(hashlib.blake2b(self.name.encode("utf-8"), digest_size=8).digest(), "little")
+        generator = torch.Generator().manual_seed(seed)
+        if not hasattr(self, "tau_syn_het"):
+            log_mu = math.log(max(2.0, float(self.cfg.tau_x)))
+            tau = torch.exp(log_mu + 0.85 * torch.randn(
+                self.n_post, self.n_pre, generator=generator))
+            self.tau_syn_het = tau.clamp(min=1.0, max=5000.0)
+        if not hasattr(self, "het_trace"):
+            self.het_trace = torch.zeros(self.n_post, self.n_pre)
 
     def pin_top_block_sparse_lanes(self, keep_open_fraction: float = 0.15) -> Dict[str, float]:
         """Lab.html F#44 (ATLAS, replicated on P5): Аппаратное закрепление (Pinned Memory) блочно-разреженной маски.
@@ -395,12 +368,20 @@ class GenesisSynapse:
             "top10_overlap": round(overlap, 4),
         }
 
+    def capture_epoch0_snapshot(self) -> None:
+        self.w_epoch0_snapshot = self.w_slow.clone()
+
     def kl_divergence_bits(self) -> float:
         """Lab.html F#43 (ORIN on P8): Измеряет дивергенцию Кульбака–Лейблера (в битах) между
-        начальным распределением весов эпохи 0 (`w_epoch0_snapshot`) и текущим распределением `w_slow`.
+        явно сохранённым распределением весов эпохи 0 и текущим распределением `w_slow`.
         С включённым PNN-замком (`CT-PNN + Synaptic Intelligence`) KL-дрейф остаётся строго ограниченным (< 1.5 бит)."""
+        snapshot = getattr(self, "w_epoch0_snapshot", None)
+        if not isinstance(snapshot, torch.Tensor):
+            raise RuntimeError("Capture the epoch-0 weight snapshot before measuring KL drift.")
+        if snapshot.shape != self.w_slow.shape:
+            raise RuntimeError("The epoch-0 weight snapshot shape does not match the synapse.")
         eps = 1e-6
-        p0 = (self.w_epoch0_snapshot.abs() * self.mask.float()).flatten() + eps
+        p0 = (snapshot.abs() * self.mask.float()).flatten() + eps
         p0 = p0 / p0.sum()
         pt = (self.w_slow.abs() * self.mask.float()).flatten() + eps
         pt = pt / pt.sum()
@@ -604,7 +585,10 @@ class GenesisSynapse:
         if self.enable_scaffold:
             if not external and self.chabc_window_ticks > 0:
                 self.chabc_window_ticks -= 1
-            is_hard = (self.scaffold_state == SCAFFOLD_HARD) | self.pinned_block_mask
+            is_hard = self.scaffold_state == SCAFFOLD_HARD
+            pinned_mask = getattr(self, "pinned_block_mask", None)
+            if isinstance(pinned_mask, torch.Tensor):
+                is_hard = is_hard | pinned_mask
             is_soft = (self.scaffold_state == SCAFFOLD_SOFT) & (~is_hard)
             # HARD-синапсы (грибовидные шипики в зрелой PNN) полностью неизменяемы (Δw = 0)
             dw_fast_step = torch.where(is_hard, torch.zeros_like(dw_fast_step), dw_fast_step)
@@ -689,8 +673,6 @@ class GenesisSynapse:
                 self.spine_health[r, col_idx] = 0.0
                 self.si_omega[r, col_idx] = 0.0
                 self.si_importance[r, col_idx] = 0.0
-                if r // 16 < self._dirty_blocks.shape[0] and col_idx // 16 < self._dirty_blocks.shape[1]:
-                    self._dirty_blocks[r // 16, col_idx // 16] = True
 
         # Если в зоне высокая ошибка предсказания (r_err / error_level) или повышен BDNF,
         # нейротрофин BDNF повышает целевую плотность связей для рекрутинга новых синапсов!
@@ -725,8 +707,6 @@ class GenesisSynapse:
                 n_sprout = int(rows.numel())
             else:
                 n_sprout = 0
-        if n_prune > 0 or n_sprout > 0:
-            self._rebuild_sparseprop_index()
         self.last_pruned = n_prune
         self.last_sprouted = n_sprout
         self.total_pruned += n_prune
@@ -840,7 +820,6 @@ class GenesisSynapse:
         self.w_fast.mul_(1.0 - factor)
         self.tag.mul_(0.5)
         self.u_syn.fill_(1.0)
-        self._dirty_blocks.zero_()
 
     def promote_scaffold_first(self, weight_quantile: float = 0.80) -> int:
         """Scaffold-first инициализация (snnscience.docx §3.7): опорные связи базовых паттернов

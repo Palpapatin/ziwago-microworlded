@@ -155,3 +155,36 @@ def test_language_snapshot_replays_window_and_restores_prediction_telemetry(core
     assert torch.equal(out_a.spike_count_window, out_b.spike_count_window)
     assert torch.equal(features, loop.last_features)
     assert torch.equal(raster, loop.last_spike_raster)
+
+
+def test_language_snapshot_restores_workspace_history_telemetry_and_next_result(core):
+    gw = core.son_column.gw
+    gw.energy_hist[:] = [0.125, 0.25]
+    gw.telemetry["energy"] = 0.25
+    gw.telemetry["test_marker"] = "saved branch"
+    snapshot = core.export_language_dynamic_state()
+
+    candidates = [
+        torch.linspace(0.0, 1.0, gw.cfg.d_gw),
+        torch.linspace(1.0, 0.0, gw.cfg.d_gw),
+    ]
+    expected = gw.compete(candidates, ne=0.2)
+    expected_history = list(gw.energy_hist)
+    expected_telemetry = dict(gw.telemetry)
+
+    gw.energy_hist[:] = [-1.0]
+    gw.telemetry["energy"] = -1.0
+    gw.telemetry["test_marker"] = "discarded branch"
+    core.load_language_dynamic_state(snapshot)
+
+    assert gw.energy_hist == [0.125, 0.25]
+    assert gw.telemetry["energy"] == 0.25
+    assert gw.telemetry["test_marker"] == "saved branch"
+    assert gw.telemetry["energy_consumer_connected"] is False
+    actual = gw.compete(candidates, ne=0.2)
+    torch.testing.assert_close(actual.broadcast, expected.broadcast, rtol=0, atol=0)
+    assert actual.energy == expected.energy
+    assert actual.ignition == expected.ignition
+    assert actual.coherence_weights == expected.coherence_weights
+    assert gw.energy_hist == expected_history
+    assert gw.telemetry == expected_telemetry

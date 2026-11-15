@@ -19,6 +19,7 @@ AttributeError/KeyError (несуществующий публичный кон�
 """
 from __future__ import annotations
 
+import ast
 import math
 import sys
 from pathlib import Path
@@ -289,6 +290,42 @@ def test_son_reports_real_selected_vte_trajectory_index():
     assert best_idx == 2
     verdict = _son_step(son)
     assert int(verdict.selected_vte_trajectory_idx) == 2
+
+
+def test_flat_generation_notifies_son_after_overriding_vte_selection():
+    source = (ROOT / "ziwago" / "organism" / "flat.py").read_text(encoding="utf-8")
+    tree = ast.parse(source)
+    organism = next(
+        node for node in tree.body
+        if isinstance(node, ast.ClassDef)
+        and node.name == "ZiwagoPureSynapticDialogueOrganismV14"
+    )
+    generate = next(
+        node for node in organism.body
+        if isinstance(node, ast.FunctionDef)
+        and node.name == "pure_neural_generate_response"
+    )
+    override_lines = [
+        node.lineno for node in ast.walk(generate)
+        if isinstance(node, ast.Assign)
+        and any(isinstance(target, ast.Name) and target.id == "best_idx"
+                for target in node.targets)
+        and isinstance(node.value, ast.Call)
+        and isinstance(node.value.func, ast.Name)
+        and node.value.func.id == "min"
+    ]
+    notify_lines = [
+        node.lineno for node in ast.walk(generate)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Attribute)
+        and node.func.attr == "note_vte_selection"
+        and len(node.args) == 1
+        and isinstance(node.args[0], ast.Name)
+        and node.args[0].id == "best_idx"
+    ]
+    assert len(override_lines) == 1
+    assert len(notify_lines) == 1
+    assert notify_lines[0] > override_lines[0]
 
 
 def test_son_has_minimal_dopamine_d1_go_gate():

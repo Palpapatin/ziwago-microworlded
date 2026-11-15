@@ -92,6 +92,20 @@ class V20IntegrationTests(unittest.TestCase):
                 raise ValueError("probe")
         assert_tree_equal(self, before, core.export_runtime_state())
 
+    def test_runtime_restore_replays_next_present_identically(self):
+        core = tiny_core()
+        core.enable_integrated_organism()
+        x = torch.ones(64) * 0.2
+        snapshot = core.export_runtime_state()
+
+        for _ in range(core.life.cfg.ticks_per_token):
+            core.life.tick(core, x)
+        expected = core.export_runtime_state()
+
+        core.load_runtime_state(snapshot)
+        core.life.present(core, x)
+        assert_tree_equal(self, expected, core.export_runtime_state())
+
     def test_dynamic_snapshot_roundtrip_covers_v20_elapsed_fields(self):
         core = tiny_core()
         core.enable_integrated_organism()

@@ -34,6 +34,8 @@ def test_column_reports_actual_synaptic_rows_changed_and_respects_learning_flag(
     x_ff = torch.ones(1, 4)
     x_fb = torch.ones(1, 8)
     col.pyr.theta.fill_(-100.0)
+    for syn in (col.w_ff, col.w_fb, col.w_rec):
+        syn.capture_epoch0_snapshot()
     _ = col.step(x_ff, x_fb, f_mod=1.0, vip_mod=0.0, learn=True)
 
     matrices = (col.w_ff, col.w_fb, col.w_rec)

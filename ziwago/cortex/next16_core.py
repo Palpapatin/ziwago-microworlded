@@ -11,7 +11,7 @@ import re
 import zlib
 from collections import Counter
 from pathlib import Path
-from typing import Dict, List, Optional, Sequence, Tuple
+from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 import torch
 import torch.nn.functional as F
@@ -353,7 +353,7 @@ class TwoCompartmentLarkumMicrocircuit:
                 "mg_unblock_factor": round(mg_unblock, 4),
                 "bac_burst_flag": bac_burst_flag,
                 "burst_gain": burst_gain,
-                "urbanczik_senn_error_norm": round(float(urbanczik_senn_error := urbanczik_senn_delta.norm().item()), 4),
+                "urbanczik_senn_error_norm": round(float(urbanczik_senn_delta.norm().item()), 4),
             }
 
 

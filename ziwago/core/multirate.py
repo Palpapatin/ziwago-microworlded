@@ -316,6 +316,41 @@ class MinicolumnStateHierarchy:
             adapt0 * ead,
         )
 
+    # Поля, появившиеся ПОСЛЕ схемы снимков v19. В старом снимке их нет, а код
+    # читал их напрямую — падало с AttributeError на каждом шаге (после
+    # восстановления модель молчала). Здесь они достраиваются значениями по
+    # умолчанию, и СПИСОК достроенного попадает в `restore_completed_fields`.
+    _RESTORE_DEFAULTS: Dict[str, object] = {
+        "measured_exact_wakeup_neurons": 0,
+        "measured_state_vars_touched": 0,
+        "measured_synaptic_rows_updated": 0,
+        "measured_synaptic_weight_updates": 0,
+        "measured_neuron_updates": 0,
+        "total_exact_wakeups": 0,
+        "last_causal_cone_check": None,
+        "_causal_ticks_since_check": 0,
+    }
+
+    def _ensure_restore_fields(self) -> None:
+        """Достроить поля, которых нет в старом снимке (v19)."""
+        for name, default in self._RESTORE_DEFAULTS.items():
+            if not hasattr(self, name):
+                setattr(self, name, default)
+        n_tiles, n_neurons = int(self.n_tiles), int(self.n_neurons)
+        for name, value in (
+            ("pending_wakeup_v", torch.full((n_neurons,), float(self.e_l), dtype=torch.float32)),
+            ("pending_wakeup_adapt", torch.zeros(n_neurons, dtype=torch.float32)),
+            ("pending_wakeup_valid", torch.zeros(n_neurons, dtype=torch.bool)),
+            ("tile_sleep_conductances_known", torch.zeros(n_tiles, dtype=torch.bool)),
+            ("g_ampa_sleep", torch.zeros(n_neurons, dtype=torch.float32)),
+            ("g_nmda_sleep", torch.zeros(n_neurons, dtype=torch.float32)),
+            ("g_gaba_sleep", torch.zeros(n_neurons, dtype=torch.float32)),
+            ("adapt_sleep", torch.zeros(n_neurons, dtype=torch.float32)),
+            ("v_sleep", torch.full((n_neurons,), float(self.e_l), dtype=torch.float32)),
+        ):
+            if not hasattr(self, name):
+                setattr(self, name, value)
+
     def update_tiers(
         self,
         tick: int,
@@ -346,6 +381,7 @@ class MinicolumnStateHierarchy:
         кандидат (`pending_wakeup_v`, `last_wakeup`) и применяется явно через
         `apply_pending_wakeup()`.
         """
+        self._ensure_restore_fields()
         self.measured_neuron_updates += int(measured_neuron_updates)
         self.measured_synaptic_rows_updated += int(measured_synaptic_rows_updated)
         self.measured_synaptic_weight_updates += int(measured_synaptic_weight_updates)

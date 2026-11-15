@@ -770,7 +770,8 @@ class Hippocampus:
         n_ep = len(self.episodes)
         ado_ok = bool(ado >= float(swr_adenosine_threshold))
         ach_ok = bool(float(ach) <= float(swr_ach_max))
-        gate_open = bool(ado_ok and ach_ok and n_ep > 0)
+        cortical_write_connected = callable(cortical_write)
+        gate_open = bool(ado_ok and ach_ok and n_ep > 0 and cortical_write_connected)
         skipped_reason = None
         replayed: List[int] = []
         if n_ep <= 0:
@@ -779,7 +780,7 @@ class Hippocampus:
             skipped_reason = "adenosine_below_threshold"
         elif not ach_ok:
             skipped_reason = "ach_above_threshold"
-        elif cortical_write is None:
+        elif not cortical_write_connected:
             skipped_reason = "no_cortical_write"
         else:
             replayed = self.swr_replay(cortical_write, learn=True, direction=direction)
@@ -802,6 +803,7 @@ class Hippocampus:
             "ach_gate_open": ach_ok,
             "episodes": int(n_ep),
             "swr_gate_open": gate_open,
+            "swr_cortical_write_connected": cortical_write_connected,
             "swr_skipped_reason": skipped_reason,
             "replayed": list(replayed),
             "replay_direction": getattr(self, "_last_replay_dir", None),

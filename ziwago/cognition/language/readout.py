@@ -580,9 +580,6 @@ class DendriticPlateauMatrixReadout:
         block = self.output_capacity_block
         cap = ((n_active + block - 1) // block) * block
 
-        pos_vecs = state.get("pos_phase_vecs")
-        w_bas = state.get("w_basal_branch")
-        w_api = state.get("w_apical_branch")
         # Окно позиций, фазовые векторы, апикальная ветвь и гиппокампальная
         # траектория восстанавливаются единым наложением (см. apply_checkpoint_overlay).
         self.apply_checkpoint_overlay(state)

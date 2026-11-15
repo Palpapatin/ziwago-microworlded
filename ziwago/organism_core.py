@@ -656,15 +656,15 @@ class ZiwagoOrganism:
             life.sleep_report.update({"sws_homeostasis": {"norm_before": before, "norm_after": after,
                                                          "downscale_factor": 0.992},
                 "ca3_apoptosis_repair": core.execute_sws_ca3_apoptotic_pole_sanitization()})
-            # ГИППОКАМП В СНЕ (13.11, трек B): SWR-реплей и REM-рекомбинация
-            # были написаны, но не вызывались НИ ОДНОГО раза — то есть спящий
-            # организм не реплеировал память. Теперь фаза REM реально запускает
-            # гиппокамп, и его отчёт попадает в sleep_report (видно, что он
-            # сделал, а не «модуль существует»).
+            # Hippocampal sleep reports SWR and REM status in the live transition.
+            # No production consumer currently defines a justified cortical_write
+            # update for replayed episodes; keep SWR disabled rather than inventing
+            # a training target. Hippocampus reports `no_cortical_write`.
             hippo = getattr(life, "hippo", None)
             if hippo is not None and hasattr(hippo, "sleep_cycle"):
                 chem_s = core.chemistry.s
                 life.sleep_report["hippocampus_sleep"] = hippo.sleep_cycle(
+                    cortical_write=None,
                     adenosine=float(getattr(chem_s, "ado", 0.0)),
                     ach=float(getattr(chem_s, "ach", 0.0)),
                     rem=True)

@@ -138,7 +138,8 @@ def _resolve_runtime_class(module, name):
     return getattr(importlib.import_module(module), name)
 
 
-def load_runtime_tree(current, state, _tensor_memo=None, _reuse_current_tensors=False):
+def load_runtime_tree(current, state, _tensor_memo=None, _reuse_current_tensors=False,
+                      _remove_missing_attributes=False):
     """Restore data-only state without breaking shared tensor identity."""
     if _tensor_memo is None:
         _tensor_memo = {}
@@ -165,7 +166,8 @@ def load_runtime_tree(current, state, _tensor_memo=None, _reuse_current_tensors=
     if isinstance(state, list):
         old = current if isinstance(current, list) else []
         return [load_runtime_tree(old[i] if i < len(old) else None, v, _tensor_memo,
-                                  _reuse_current_tensors) for i, v in enumerate(state)]
+                                  _reuse_current_tensors, _remove_missing_attributes)
+                for i, v in enumerate(state)]
     if not isinstance(state, dict):
         return state
     if "__path__" in state:
@@ -182,13 +184,13 @@ def load_runtime_tree(current, state, _tensor_memo=None, _reuse_current_tensors=
     if "__sequence__" in state:
         old = list(current) if isinstance(current, (tuple, set)) else []
         vals = [load_runtime_tree(old[i] if i < len(old) else None, v, _tensor_memo,
-                                  _reuse_current_tensors)
+                                  _reuse_current_tensors, _remove_missing_attributes)
                 for i, v in enumerate(state["items"])]
         return tuple(vals) if state["__sequence__"] == "tuple" else set(vals)
     if "__deque__" in state:
         old = list(current) if isinstance(current, deque) else []
         vals = [load_runtime_tree(old[i] if i < len(old) else None, v, _tensor_memo,
-                                  _reuse_current_tensors)
+                                  _reuse_current_tensors, _remove_missing_attributes)
                 for i, v in enumerate(state["__deque__"])]
         return deque(vals, maxlen=state.get("maxlen"))
     if "__object__" in state:
@@ -203,15 +205,17 @@ def load_runtime_tree(current, state, _tensor_memo=None, _reuse_current_tensors=
         preserve_extra = isinstance(obj, cls) and type(obj) is not cls
         if not preserve_extra:
             for key in list(vars(obj)):
-                if key not in attrs and not callable(getattr(obj, key)):
+                if ((key.startswith("_last_") or _remove_missing_attributes)
+                        and key not in attrs and not callable(getattr(obj, key))):
                     delattr(obj, key)
         for key in list(attrs.keys()):
             val = attrs[key]
             setattr(obj, key, load_runtime_tree(getattr(obj, key, None), val, _tensor_memo,
-                                                _reuse_current_tensors))
+                                                _reuse_current_tensors, _remove_missing_attributes))
         return obj
     old = current if isinstance(current, dict) else {}
-    return {k: load_runtime_tree(old.get(k), v, _tensor_memo, _reuse_current_tensors)
+    return {k: load_runtime_tree(old.get(k), v, _tensor_memo, _reuse_current_tensors,
+                                 _remove_missing_attributes)
             for k, v in state.items()}
 
 
@@ -1218,13 +1222,12 @@ class SparselyGatedCorticalMoE:
             # Validate the shared clock and fixed neuron dt BEFORE any mutation.
             assert isinstance(organism_context["tick"], int)
             # ВЛАДЕЛЕЦ ТАКТА — интегрированный драйвер (он же владеет химией).
-            # Кора принимает такт владельца, но контракт ЖЁСТКИЙ: следующий
-            # такт = предыдущий + 1. Частичное восстановление состояния
-            # (погрупповая загрузка атрибутов) обязано восстанавливать и часы
-            # владельца, иначе расходились бы два счётчика.
-            assert organism_context["tick"] == self.global_clock_tick + 1, (
-                "the shared clock must advance by exactly one tick: "
-                f"context={organism_context['tick']} != cortex={self.global_clock_tick} + 1")
+            # Кора принимает такт владельца и не ведёт свой счётчик. Инвариант —
+            # строгое продвижение вперёд: ровно «+1» неверно, потому что химия
+            # тикает и вне коры (например, во сне), и тогда кору догоняют.
+            assert organism_context["tick"] > self.global_clock_tick, (
+                "the shared clock must advance: "
+                f"context={organism_context['tick']} <= cortex={self.global_clock_tick}")
             assert all(col.pyr.cfg.dt == 1.0 for col in self.columns)
             assert organism_context["zone_atp"].shape == (self.n_columns,)
             assert organism_context["zone_ado"].shape == (self.n_columns,)
@@ -1426,7 +1429,7 @@ class SparselyGatedCorticalMoE:
         synapse_fields = (
             "last_block_emptiness_ratio", "crossover_density", "last_sparseprop_complexity_ops",
             "last_dense_complexity_ops", "cum_useful_macs", "cum_issued_macs",
-            "last_flop_efficiency", "sparseprop_heap", "_dirty_blocks",
+            "last_flop_efficiency", "sparseprop_heap",
         )
         for cid, col in enumerate(self.columns):
             paths.extend(("columns", cid, name) for name in (
@@ -1474,10 +1477,12 @@ class SparselyGatedCorticalMoE:
         """All weights, neuron compartments, synapses, clocks and routing state."""
         return {"runtime_version": 1, "state": export_runtime_tree(self)}
 
-    def load_state_dict(self, state: Dict[str, object]) -> None:
+    def load_state_dict(self, state: Dict[str, object],
+                        remove_missing_attributes: bool = False) -> None:
         if "state" not in state:
             raise ValueError("MoE snapshot is missing its complete runtime tree")
-        load_runtime_tree(self, state["state"])
+        load_runtime_tree(self, state["state"],
+                          _remove_missing_attributes=remove_missing_attributes)
 
     def routing_telemetry(self) -> Dict[str, object]:
         total_calls = max(1, int(self.expert_activation_counts.sum().item()))

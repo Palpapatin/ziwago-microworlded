@@ -59,6 +59,7 @@ class GlobalWorkspace:
             "energy": 0.0,
             "energy_consumer_connected": False,
             "energy_consumer_points": [],
+            "energy_consumer_reason": "diagnostic_only_no_approved_consumer_contract",
         }
 
     def _telemetry(self) -> dict:
@@ -68,11 +69,16 @@ class GlobalWorkspace:
                 "energy": 0.0,
                 "energy_consumer_connected": False,
                 "energy_consumer_points": [],
+                "energy_consumer_reason": "diagnostic_only_no_approved_consumer_contract",
             }
             self.telemetry = tel
         else:
             tel.setdefault("energy_consumer_connected", False)
             tel.setdefault("energy_consumer_points", [])
+            tel.setdefault(
+                "energy_consumer_reason",
+                "diagnostic_only_no_approved_consumer_contract",
+            )
         return tel
 
     # ------------------------------------------------------------------

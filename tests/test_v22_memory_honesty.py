@@ -255,9 +255,16 @@ def test_sleep_cycle_swr_requires_adenosine_gate():
     assert shallow["swr_gate_open"] is False
     assert shallow["replayed"] == [] and writes == []
 
+    disconnected = h.sleep_cycle(None, adenosine=0.90, ach=0.2, rem=False)
+    assert disconnected["swr_gate_open"] is False
+    assert disconnected["swr_cortical_write_connected"] is False
+    assert disconnected["swr_skipped_reason"] == "no_cortical_write"
+    assert disconnected["replayed"] == [] and writes == []
+
     deep = h.sleep_cycle(lambda ec, err: writes.append(float(err)),
                          adenosine=0.90, ach=0.2, rem=False)
     assert deep["swr_gate_open"] is True
+    assert deep["swr_cortical_write_connected"] is True
     assert len(deep["replayed"]) >= 1 and len(writes) >= 1
     assert deep["rem"] == {}, "REM не запрошен — фаза не должна выполняться"
 

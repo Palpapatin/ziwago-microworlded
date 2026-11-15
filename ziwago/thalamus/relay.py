@@ -41,15 +41,11 @@ class ThalamusFO:
     }
 
     # Честные пометки подключения (трек M, phantom-effect):
-    # BOUNDARY_CONNECTED — флаг boundary_burst доходит из ЖИВОЙ точки вызова.
-    #   Сейчас живой вызов organism/integrated.py:243 — fo.step(x, ach, ne) без
-    #   boundary_burst и без mark_phrase_boundary() ⇒ «фазовый маркер новой мысли»
-    #   из живого пути не наступает. Точка врезки: перед :243 —
-    #   self.fo.mark_phrase_boundary(), когда языковой контур закрыл клаузу.
-    # SPINDLE_CONNECTED — spindle() вызывается из живого пути (сейчас — только тесты).
-    #   Точка врезки: цикл сна (ziwago/organism_core.py sleep_cycle) —
-    #   self.fo.spindle(t_ms, 10.0) перед тиком релея.
-    BOUNDARY_CONNECTED = False
+    # BOUNDARY_CONNECTED — flat language loop помечает конец фразы на FO,
+    #   после чего следующий integrated tick потребляет одноразовый маркер.
+    # SPINDLE_CONNECTED — spindle() пока вызывается только тестами; живой цикл
+    #   сна ещё не задаёт осцилляцию перед тиком релея.
+    BOUNDARY_CONNECTED = True
     SPINDLE_CONNECTED = False
 
     def __init__(self, n: int, name: str = "FO"):
@@ -62,6 +58,7 @@ class ThalamusFO:
         self._spindle_osc: Optional[torch.Tensor] = None  # фаза веретена на один шаг
         self._boundary_pending = False    # одноразовый маркер границы фразы
         self.telemetry: dict = dict(self._TELEMETRY_DEFAULTS)
+        self._telemetry()
 
     def _telemetry(self) -> dict:
         """Единый словарь телеметрии; чинится, если его снесло восстановление снимка."""

@@ -1,4 +1,4 @@
-"""Популяция SON (Self-Observing Neurons) и 17-я Колонка Рефлексии (`Col16_SON_BA10`).
+r"""Популяция SON (Self-Observing Neurons) и 17-я Колонка Рефлексии (`Col16_SON_BA10`).
 
 Реализует биофизический контур самонаблюдения, внутренней речи (`VTE Inner Speech`),
 обнаружения когнитивного диссонанса и естественного моторного торможения конца мысли (`SON EOS Gate`)
@@ -267,7 +267,7 @@ class SONReflectiveColumn:
         stimulus_vec64: torch.Tensor,
         candidate_trajectories: List[Tuple[str, List[int], torch.Tensor, float, float]],
     ) -> Tuple[int, List[Dict[str, object]]]:
-        """Функция B (`VTE Inner Speech Rollout` — Внутренний Монолог перед ответом):
+        r"""Функция B (`VTE Inner Speech Rollout` — Внутренний Монолог перед ответом):
 
         Дофаминовый гейт `D1 Go` — минимальная модель выбора плана (striatum / BG):
         по уже вычисленным для каждой траектории величинам (`cos_qa`, `syn_coh`, `conflict_e`)

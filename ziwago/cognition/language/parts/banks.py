@@ -101,7 +101,6 @@ class ReadoutBanks:
 
             for tid in response_ids:
                 readout._ensure_token_col(tid)
-            n_active = len(readout.col_to_tok)
             v_zero = q_norm
             d_list: List[torch.Tensor] = []
             col_targets: List[int] = []

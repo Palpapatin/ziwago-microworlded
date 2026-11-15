@@ -156,6 +156,21 @@ class ZiwagoBiologicalSNNAssistant:
                 was_clarification_request=not grounded, response_passport=passport)
         return result
 
+    @staticmethod
+    def _action_evidence(resonance: float, enable_active_inference: bool) -> list:
+        """Веса действий для action-контекста (7 компонент, все ≥ 0).
+
+        Резонанс CA3 у обученной модели БЫВАЕТ > 1 (до 2.5), а evidence —
+        нормированные веса: отрицательная компонента отвергалась валидатором
+        action-контекста, и маршрутизация падала на каждом запросе с сильным
+        резонансом. Поэтому резонанс прижимается в [0, 1]
+        (max/min устойчивы к NaN: nan → 0.0).
+        """
+        resonance_gate = min(1.0, max(0.0, float(resonance)))
+        return [0., 0., 0., 0.,
+                (1.0 - resonance_gate) * 0.5 if enable_active_inference else 0.,
+                0., 0.6 + 0.4 * resonance_gate]
+
     def chat(self, user_utterance: str, max_tokens: int = 64, enable_active_inference: bool = True) -> dict:
         started = time.perf_counter()
         prompt = user_utterance.strip()
@@ -193,8 +208,7 @@ class ZiwagoBiologicalSNNAssistant:
             elif history or cf or analogy or multi:
                 evidence = [float(history), 0., float(cf), float(analogy), 0., float(multi), 0.]
             else:
-                evidence = [0., 0., 0., 0., (1.0 - resonance) * 0.5 if enable_active_inference else 0.,
-                            0., 0.6 + 0.4 * resonance]
+                evidence = self._action_evidence(resonance, enable_active_inference)
             decision = self.genesis.select_action(q, evidence)
             result.update({"organism_decision": decision, "abandoned_decision": abandoned,
                            "ca3_top1_resonance": resonance})

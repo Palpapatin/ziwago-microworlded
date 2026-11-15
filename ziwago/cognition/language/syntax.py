@@ -15,6 +15,11 @@ class BA44AttractorSyntaxBridge:
     r"""Реализует биофизический **Синтаксический Мост Зоны Брока (`Col0_SYNTAX_BA44` Syntax Bridge)**
     между двумя последовательными смысловыми аттракторами `CA3` ($\vec{Q}_1 \to \vec{Q}_2$):
 
+      ПРИМЕЧАНИЕ О НАУЧЕНИИ: `learn_bridge_transition` — только примитив для внешне
+      размеченной пары (два вектора перехода + независимо заданный индекс союза).
+      В production-контуре нет источника такой метки и этот примитив не вызывается;
+      сгенерированный или самостоятельно выбранный мост не является целевой меткой.
+
       1. ПОЧЕМУ БЕЗ МОСТА ПОЛУЧАЛАСЬ СКЛЕЙКА ДВУХ ОТДЕЛЬНЫХ ПРЕДЛОЖЕНИЙ (АТТРАКТОРНАЯ КОНКАТЕНАЦИЯ):
          Когда первый аттрактор $\vec{Q}_1$ доходил до конца своей клаузы, он генерировал терминальную точку `.`
          (или `!`), а второй аттрактор $\vec{Q}_2$ стартовал с заглавной буквы и вводного междометия (`"Yes,"`, `"Ah,"`, `"That sounds great!"`).
@@ -83,8 +88,9 @@ class BA44AttractorSyntaxBridge:
         self.bridge_last_cos: Dict[int, float] = {}
 
     def initialize_synaptic_connectors(self, encode_fn, decode_fn, get_vec64_fn, vocab_map: Dict[str, int]) -> None:
-        r"""Обучает синаптические столбцы матрицы $W_{\text{BA44\_bridge}}$ на векторах союзов (`while`, `before`, `after`, `because`, `and`),
-        строит синаптическое отображение заглавных токенов в строчные и инициализирует синапсы **Дейктического Сдвига Лица (`TPJ Deictic Shift`)**."""
+        r"""Задаёт начальные столбцы из лексических векторов союзов (`while`, `before`, `after`, `because`, `and`),
+        строит отображение заглавных токенов в строчные и инициализирует **TPJ Deictic Shift**.
+        Лексическая инициализация не является меткой перехода и не вызывает `learn_bridge_transition`."""
         with torch.no_grad():
             comma_id = int(vocab_map.get(",", 11))
             for idx, (trig_word, bridge_phrase) in enumerate(self.BRIDGE_CONNECTORS):
@@ -239,9 +245,14 @@ class BA44AttractorSyntaxBridge:
         connector_idx: int,
         lr: Optional[float] = None,
     ) -> dict:
-        r"""Онлайн-научение столбца моста BA44 на РЕАЛЬНОЙ паре перехода $\vec{Q}_1 \to \vec{Q}_2$:
-        локальное хеббовское правило без backprop, столбец подтягивается к направлению
-        перехода и нормируется заново, поэтому $\cos(\vec{x}, W[:, k]) \to 1$ за несколько предъявлений:
+        r"""Низкоуровневое обновление столбца BA44 на внешне размеченной паре перехода
+        $\vec{Q}_1 \to \vec{Q}_2$. `connector_idx` должен поступать из независимой
+        разметки, а не из генерации/самостоятельного выбора моста. В текущем production
+        источника такой разметки и вызова этого метода нет.
+
+        Обновление выполняется локальным хеббовским правилом без backprop: столбец
+        подтягивается к направлению перехода и нормируется заново, поэтому
+        $\cos(\vec{x}, W[:, k]) \to 1$ за несколько предъявлений:
 
         $$W[:,k] \leftarrow \mathrm{normalize}\big((1-\lambda)\,W[:,k] + \lambda\,\vec{x}\big)$$
 
@@ -271,6 +282,24 @@ class BA44AttractorSyntaxBridge:
             "lr": rate,
             "cos_after": cos_after,
             "learn_events": int(self.bridge_learn_events[idx]),
+            "production_connection": "disconnected",
+            "supervision_source": "externally_supplied_connector_label",
+        }
+
+    def bridge_learning_telemetry(self) -> dict:
+        """Отчёт о внешних вызовах примитива; production-обучение остаётся отключённым."""
+        return {
+            "production_connection": "disconnected",
+            "supervision_source": "externally_supplied_connector_label",
+            "connectors": [
+                {
+                    "connector_idx": idx,
+                    "connector_name": name,
+                    "learn_events": int(self.bridge_learn_events.get(idx, 0)),
+                    "last_cos": self.bridge_last_cos.get(idx),
+                }
+                for idx, (name, _) in enumerate(self.BRIDGE_CONNECTORS)
+            ],
         }
 
     def score_bridges(

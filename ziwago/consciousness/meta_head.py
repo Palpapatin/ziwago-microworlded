@@ -34,10 +34,11 @@ calibration_corr = corr(confidence, 1−err) — мера КАЛИБРОВКИ �
 проба: уверенность читается ДО апдейта на этой же пробе, поэтому физический
 минимум запаздывания = 1 проба.
 
-Выход управляет поведением: confidence < θ_low гейтит действия,
-увеличивает β_GW (крутизну ignition) и приоритет реплея. Все три обучаемых
-выхода (confidence, L̂, novelty_unit) сведены в gates; перенос гейтов в
-параметры потребителей — публичный контракт `apply_gates()`.
+В активном integrated-контуре confidence передаётся в action uncertainty, а
+`replay_priority` — в кредит реплея с задержкой в один тик. `bg_threshold`,
+`beta_gw_boost` и `trn_gain` вычисляются, но не подключены: у них нет
+утверждённого контракта потребителя. `apply_gates()` только формирует значения
+для возможных потребителей и сам по себе не подключает их.
 """
 from __future__ import annotations
 
@@ -66,16 +67,10 @@ class MetaOut:
 
 @dataclass
 class GateApplication:
-    """Гейты MetaHead, перенесённые в параметры потребителей.
+    """Кандидатные значения гейтов MetaHead; не означает live-проводку.
 
-    beta_gw          — β_GW с добавкой гейта (крутизна ignition): вход
-                       `beta_boost` в `GlobalWorkspace.compete()`
-                       (workspace.py:86 `beta = (c.beta_gw + beta_boost)·(1+0.5·ne)`).
-    replay_priority  — приоритет реплея с добавкой новизны/сюрприза/эпистемики.
-    trn_gain         — множитель гейна TRN, тензор той же формы, что вход
-                       (→ `SONReflectionVerdict.trn_column_gain_modulation`,
-                       son_reflection.py:249).
-    bg_threshold     — 0/1 ворот допуска действия в базальные ганглии.
+    `replay_priority` имеет production-потребителя. Потребители остальных
+    значений пока не утверждены.
     """
     beta_gw: float
     replay_priority: float
@@ -88,11 +83,9 @@ class MetaHead:
     Genesis level4/meta_head.py): фиксированная рекуррентная проекция в спайковый
     резервуар + чисто локальная синаптическая пластичность без backprop."""
 
-    # Честная телеметрия подключения (трек M, phantom-effect): живой путь
-    # (organism/integrated.py:294) вызывает только step(); apply_gates() и
-    # gates НЕ потребляются ⇒ гейты считаются и выбрасываются.
-    # Точка врезки: сразу после `meta = son.meta_head.step(...)` (integrated.py:294)
-    # вызвать apply_gates(...) и раздать app.* потребителям; затем поставить True.
+    # False означает, что весь контракт apply_gates не подключён. Сейчас
+    # IntegratedOrganism потребляет только replay_priority (с задержкой в тик);
+    # остальные выходы остаются отключёнными.
     GATES_CONNECTED = False
 
     def __init__(self, cfg: MetaHeadCfg, d_gw: int, seed: int = 0):
@@ -220,18 +213,11 @@ class MetaHead:
     # ------------------------------------------------------------------
     def apply_gates(self, out: MetaOut, trn_gain: torch.Tensor,
                     beta_gw: float, replay_priority: float) -> GateApplication:
-        """Перенести гейты MetaOut в параметры потребителей (публичный контракт).
+        """Преобразовать выходы в кандидатные значения (не подключает consumer).
 
-        Аддитивные гейты складываются с базовым значением потребителя,
-        мультипликативный (trn_gain) — умножает тензор гейнов той же формы.
-
-        Точка врезки в organism/integrated.py: сразу после
-        `meta = son.meta_head.step(...)` (:279) вызвать
-        `app = son.meta_head.apply_gates(meta, trn_gain=<гейны TRN>,
-         beta_gw=self.cfg.beta_gw, replay_priority=<приоритет реплея>)` и
-        передать `app.bg_threshold` в ворота BG/действия, `app.beta_gw` — в
-        `gw.compete(beta_boost=...)`, `app.replay_priority` — в очередь реплея,
-        `app.trn_gain` — в `SONReflectionVerdict.trn_column_gain_modulation`.
+        В integrated production-пути используется отдельная одноканальная
+        проводка `replay_priority`; остальные значения намеренно не передаются
+        потребителям до утверждения их контрактов.
         """
         g = out.gates
         trn_t = trn_gain if torch.is_tensor(trn_gain) \
@@ -243,19 +229,65 @@ class MetaHead:
             bg_threshold=float(g["bg_threshold"]),
         )
 
-    def telemetry(self, recent: Optional[MetaOut] = None) -> Dict[str, object]:
-        """Честная телеметрия: не подключённые гейты явно помечены как отключённые."""
+    def telemetry(self, recent: Optional[MetaOut] = None,
+                  replay_priority_connected: bool = False) -> Dict[str, object]:
+        """Раздельно сообщает статус общего контракта и каждого gate-канала."""
+        connected_channels = ["replay_priority"] if replay_priority_connected else []
+        replay_reason = (
+            None if replay_priority_connected
+            else "disabled_by_meta_replay_priority_enabled"
+        )
         payload: Dict[str, object] = {
             "gates_connected": bool(self.GATES_CONNECTED),
             "gate_contract": "apply_gates(out, trn_gain, beta_gw, replay_priority)",
             "gate_keys": ["bg_threshold", "beta_gw_boost", "replay_priority", "trn_gain"],
-            "novelty_unit_consumed": False,
-            "live_consumer_points": [],
+            "connected_gate_channels": connected_channels,
+            "gate_channel_status": {
+                "replay_priority": {
+                    "connected": bool(replay_priority_connected),
+                    "consumer": "IntegratedOrganism.record_credit",
+                    "reason": replay_reason,
+                },
+                "bg_threshold": {
+                    "connected": False,
+                    "consumer": None,
+                    "reason": "no_approved_action_gate_consumer_contract",
+                },
+                "beta_gw_boost": {
+                    "connected": False,
+                    "consumer": None,
+                    "reason": "no_approved_workspace_ignition_consumer_contract",
+                },
+                "trn_gain": {
+                    "connected": False,
+                    "consumer": None,
+                    "reason": "no_approved_trn_gain_consumer_contract",
+                },
+            },
+            "novelty_unit_consumed": bool(replay_priority_connected),
+            "novelty_unit_consumer": (
+                "MetaHead.replay_priority" if replay_priority_connected else None
+            ),
+            "novelty_unit_direct_consumer_connected": False,
+            "novelty_unit_direct_consumer_reason": (
+                "novelty_unit_is_folded_into_replay_priority"
+                if replay_priority_connected else "replay_priority_channel_disabled"
+            ),
+            "live_consumer_points": ([
+                "IntegratedOrganism.record_credit (one-tick delayed; config-controlled)"
+            ] if replay_priority_connected else []),
         }
         if recent is not None:
             payload.update({
                 "confidence": float(recent.confidence),
+                "predicted_loss": float(recent.predicted_loss),
+                "surprise": float(recent.surprise),
+                "novelty": float(recent.novelty),
                 "novelty_unit": float(recent.novelty_unit),
+                "epistemic": float(recent.epistemic),
+                "aleatoric": float(recent.aleatoric),
+                "calibration_corr": float(recent.calibration_corr),
+                "latest_gates": {key: float(value) for key, value in recent.gates.items()},
                 "replay_priority": float(recent.gates["replay_priority"]),
                 "bg_threshold": float(recent.gates["bg_threshold"]),
             })

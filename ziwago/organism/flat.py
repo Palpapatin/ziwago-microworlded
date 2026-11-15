@@ -524,7 +524,8 @@ class ZiwagoPureSynapticDialogueOrganismV14:
     def export_runtime_state(self) -> Dict[str, object]:
         """Data-only full core snapshot for checkpoints and transactional evaluation."""
         import numpy as np
-        excluded = {"root", "dialog_streamer", "moe_cortex", "spiking_language_loop"}
+        excluded = {"root", "dialog_streamer", "moe_cortex", "spiking_language_loop",
+                     "restore_migrations"}
         core = {k: v for k, v in vars(self).items() if k not in excluded and not k.startswith("external_") and not callable(v)}
         np_state = np.random.get_state()
         return {
@@ -542,32 +543,33 @@ class ZiwagoPureSynapticDialogueOrganismV14:
             "bpe_cache": export_runtime_tree(_gpt2_mod._WORKER_CACHE),
         }
 
-    def load_runtime_state(self, state: Dict[str, object]) -> None:
+    def load_runtime_state(self, state: Dict[str, object],
+                           remove_missing_attributes: bool = False) -> None:
         import numpy as np
         if state.get("runtime_version") != 19:
             raise ValueError("Unsupported core runtime snapshot")
-        excluded = {"root", "dialog_streamer", "moe_cortex", "spiking_language_loop"}
+        excluded = {"root", "dialog_streamer", "moe_cortex", "spiking_language_loop",
+                     "restore_migrations"}
         core_state = state["core"]
-        old_keys = {k for k, v in vars(self).items()
-                    if k not in excluded and not k.startswith("external_") and not callable(v)}
-        for key in old_keys - set(core_state):
-            delattr(self, key)
-        # Staged allocation (B.1): клонируем каждый атрибут и сразу setattr'им,
-        # отпуская старый вес конструкции. Полное дерево клонов поверх старых
-        # весов (restored = load_runtime_tree(old, ...)) давало 2x-пик ~8.4 ГБ
-        # commit; поатрибутное восстановление позволяет аллокатору переиспользовать
-        # освобождаемые блоки. Семантика идентична: current = getattr(self, key)
-        # совпадает с old.get(key), memo общий preserves shared tensor identity.
+        # Checkpoint loads preserve newer fields; evaluation rollback opts into strict cleanup.
+        for key, value in list(vars(self).items()):
+            if (key not in core_state and (key.startswith("_last_") or remove_missing_attributes)
+                    and key not in excluded
+                    and not key.startswith("external_") and not callable(value)):
+                delattr(self, key)
         memo = {}
         for key, val in core_state.items():
             setattr(self, key, load_runtime_tree(
-                getattr(self, key, None), val, memo, _reuse_current_tensors=True))
+                getattr(self, key, None), val, memo, _reuse_current_tensors=True,
+                _remove_missing_attributes=remove_missing_attributes))
         if hasattr(self, "dendritic_plateau_readout"):
             router = getattr(self.dendritic_plateau_readout, "bank_router", None)
             if router is not None and not hasattr(router, "prune_threshold"):
                 router.prune_threshold = 1e-4
-        self.moe_cortex.load_state_dict(state["moe_cortex"])
-        self.spiking_language_loop.load_state_dict(state["spiking_language_loop"])
+        self.moe_cortex.load_state_dict(
+            state["moe_cortex"], remove_missing_attributes=remove_missing_attributes)
+        self.spiking_language_loop.load_state_dict(
+            state["spiking_language_loop"], remove_missing_attributes=remove_missing_attributes)
         self.spiking_language_loop.moe_cortex = self.moe_cortex
         rng = state["rng"]
         random.setstate(load_runtime_tree(None, rng["python"]))
@@ -589,7 +591,9 @@ class ZiwagoPureSynapticDialogueOrganismV14:
             "prev_free_energy", "total_son_steps", "total_motor_stops_triggered",
             "total_vte_simulations", "total_dissonance_interventions", "elig_son",
         )]
-        son_paths.extend(("gw", name) for name in ("x", "gate", "ignition", "last_coherence"))
+        son_paths.extend(("gw", name) for name in (
+            "x", "gate", "ignition", "last_coherence", "energy_hist", "telemetry",
+        ))
         son_paths.extend(("meta_head", name) for name in (
             "w_out", "b_out", "elig", "gw_centroid", "h_state", "trace_gw", "err_hist", "conf_hist",
         ))
@@ -736,7 +740,7 @@ class ZiwagoPureSynapticDialogueOrganismV14:
                     setattr(obj, name, previous)
                 else:
                     delattr(obj, name)
-            self.load_runtime_state(snapshot)
+            self.load_runtime_state(snapshot, remove_missing_attributes=True)
 
     def _record_dialogue_turn(self, *args, **kwargs) -> None:
         if self.dialogue_writes_enabled and not self._evaluation_depth:
@@ -3007,6 +3011,7 @@ class ZiwagoPureSynapticDialogueOrganismV14:
                 range(len(vte_logs)),
                 key=lambda idx: (float(vte_logs[idx]["combined_selection_score"]), idx),
             )
+        self.son_column.note_vte_selection(best_idx)
         if best_idx in beam_dynamic_states:
             total_vte_simulations = self.son_column.total_vte_simulations
             self.load_language_dynamic_state(beam_dynamic_states[best_idx])
@@ -3328,6 +3333,45 @@ class ZiwagoPureSynapticDialogueOrganismV14:
         """Не материализовать legacy-трассу щита (см. модульную функцию)."""
         return drop_legacy_shield_trace(payload)
 
+    def apply_restore_migrations(self) -> Dict[str, object]:
+        """МИГРАЦИИ ПОСЛЕ ВОССТАНОВЛЕНИЯ (единая точка).
+
+        Восстановление ставит только те поля, что были в снимке. Всё новое,
+        добавленное в живые объекты после этого чекпоинта, в снимке отсутствует
+        — и модель падала на каждом шаге (три разные поломки подряд):
+          * `astrocyte` у колонок (трек O, 14.11) → AttributeError;
+          * `ach=11.56` в химии кандидата v19 при номинальном ~0.4 → валидатор
+            action-контекста: «ach must be in [0.0, 2.0]»;
+          * новые поля регуляторов в ридеуте.
+
+        Здесь все такие разрывы закрываются ОДИН раз и ОТЧЁТНО пишутся в
+        `restore_migrations`: миграция должна быть видна, а не «тихой».
+        """
+        report: Dict[str, object] = {}
+        chem_report = self.chemistry.normalize_restored_state()
+        if chem_report:
+            report["chemistry_state"] = chem_report
+        # ЧАСЫ: владелец такта — биологический драйвер (химия). В снимке v19
+        # драйвера не было, поэтому часы коры и химии в нём не синхронизированы:
+        # после восстановления контракт «+1 за такт» падал
+        # (`context=1 != cortex=12`). Приводим кору к часам владельца.
+        chem_tick = int(getattr(self.chemistry, "tick", 0))
+        cortex_tick = int(getattr(self.moe_cortex, "global_clock_tick", chem_tick))
+        if cortex_tick != chem_tick:
+            self.moe_cortex.global_clock_tick = chem_tick
+            report["clock_sync"] = {"cortex_tick_before": cortex_tick,
+                                    "cortex_tick_after": chem_tick,
+                                    "owner": "chemistry.tick"}
+        completed = 0
+        for column in getattr(self.moe_cortex, "columns", []):
+            if hasattr(column, "_ensure_astrocyte") and not hasattr(column, "astrocyte"):
+                column._ensure_astrocyte()
+                completed += 1
+        if completed:
+            report["columns_completed"] = completed
+        self.restore_migrations = report
+        return report
+
     def load_self_contained_checkpoint(
         self,
         ckpt_path: Path,
@@ -3361,6 +3405,9 @@ class ZiwagoPureSynapticDialogueOrganismV14:
             release_redundant_runtime_payload_fields(payload)
             shield_report = self.drop_legacy_shield_trace(payload)
             self.load_runtime_state(payload["core_runtime_state"])
+            # Миграции после восстановления (новые поля, границы осей химии):
+            # единая точка + видимый отчёт.
+            self.apply_restore_migrations()
             if shield_report["dropped"]:
                 # ПОСЛЕ восстановления: load_runtime_state удаляет атрибуты,
                 # которых нет в снимке.
@@ -3477,6 +3524,8 @@ class ZiwagoPureSynapticDialogueOrganismV14:
             # Копия обязательна: mmap-отображение на Windows доступно только
             # для чтения, а модель пишет в веса на месте.
             self.load_runtime_state(runtime)
+            # Те же миграции, что и в v19-пути (новые поля, границы химии).
+            self.apply_restore_migrations()
         self.loaded_checkpoint_path = str(ckpt_path)
         return val_info
 
