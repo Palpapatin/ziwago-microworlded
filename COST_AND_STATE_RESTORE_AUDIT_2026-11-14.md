@@ -2,34 +2,44 @@
 
 ## Итог по состоянию на 2026-11-15
 
-В нескольких последовательных проходах изменены production-пути:
+Ранее были изменены SWR gating, selective Workspace snapshot и evaluation
+rollback; подробная история и их отдельные проверки приведены ниже. В текущем
+проходе закрыты найденные дефекты состояния и безопасного восстановления:
 
-* SWR явно остаётся закрытым в NREM→REM, если нет обоснованного
-  `cortical_write`; результат сообщает причину `no_cortical_write`.
-* Selective language snapshot сохраняет Workspace `energy_hist` и `telemetry`.
-* Evaluation rollback очищает новые non-callable поля, отсутствовавшие в снимке,
-  рекурсивно для объектов точного класса; внешние ссылки и подклассовые поля
-  сохраняются. Core/generic restore вне evaluation rollback не включает эту
-  строгую очистку, чтобы не удалять новые поля при восстановлении старых снимков.
-* Для оценки checkpoint добавлен read-only storage inventory
-  [`probe_checkpoint_storage_categories.py`](./tools/probes/probe_checkpoint_storage_categories.py).
+* Checkpoint загружается из тех же проверенных SHA-256 байтов, что были
+  верифицированы; unrestricted legacy pickle требует явного trust и ожидаемого
+  хеша.
+* `IntegrationConfig` применяется до checkpoint restore, поэтому создание
+  integrated driver не заменяет восстановленные replay/action/criticality state.
+* Router sweep-телеметрия восстанавливает состояние и при исключении.
+* Дендритный Ca-порог вычисляется как baseline + текущий астроцитарный сдвиг;
+  restore migration исправляет накопленный legacy-порог и записывает это в отчёт.
+* Beam rollback сохраняет динамику колонок, включая recurrent resource `u_syn`
+  даже без active ejection/integrated clock; inference не затухает выученные
+  веса через внешний синаптический clock.
+* Химическая телеметрия различает подключённый volume-eCB косвенный путь и
+  неподключённый volume-H₂S; проверен same-tick обучающий сигнал дендрита.
 
-**Проверки, воспроизводимые на маленьком состоянии:** 14 выбранных тестов и
-6 subtests прошли; tiny-core restore→`present()` probe показал 0 расхождений.
-Точные команды и результаты приведены ниже. Эти проверки не используют
-обученный v19 checkpoint.
+**Текущая проверка:** объединённый focused-набор завершился с результатом
+`74 passed, 1 warning, 8 subtests passed in 81.38s`. Единственное предупреждение
+— PyTorch сообщает, что buffer checkpoint mmap read-only, хотя tensor API
+теоретически допускает запись; hash-pin регрессионный тест прошёл. Точная команда
+и границы этого результата приведены в конце документа. Эти тесты используют
+маленькие synthetic/tiny-core состояния, не обученный v19 checkpoint.
 
-**Граница доказанного восстановления:** добавленный тест проверяет удаление
-`last_telemetry` и вложенного `last_local_plasticity_gain` после evaluation
-rollback, а также восстановление снимка при обычном и исключительном выходе.
-Это подтверждает только зафиксированные поля и сценарии тестов, не полную
-эквивалентность произвольного runtime-состояния или обученного checkpoint.
+**Граница доказанного восстановления:** тесты проверяют байты hash-pinned
+загрузки, явный `IntegrationConfig` при restore, отсутствие побочных эффектов
+router telemetry, baseline/сброс Ca-порога, парный chemical effect и beam
+кандидаты в обратном порядке с `branch_factor=2`. Это подтверждает только
+зафиксированные поля и сценарии тестов, не полную эквивалентность произвольного
+runtime-состояния или обученного checkpoint.
 
 **Не проверено:** генерация на обученном checkpoint; полный/большой набор тестов;
-причинные SWR-тесты в последнем прогоне; wall-clock snapshot/load и фиксированные
-wall-clock sleep/replay. Исторические миллисекунды ниже — только ориентир от
-2026-11-12, не текущая производительность. Оптимизацию beam rollback не
-внедряли.
+причинные SWR-тесты в текущем прогоне; wall-clock snapshot/load и фиксированные
+wall-clock sleep/replay. Исторические generation/snapshot миллисекунды ниже —
+только ориентир от 2026-11-12. Текущий отдельный microbenchmark phase-router
+приведён ниже и не является end-to-end профилем. Оптимизацию beam snapshot
+не внедряли.
 
 ### Контекст исторических замеров доступной RAM
 
@@ -290,3 +300,66 @@ core, а загрузчик восстанавливает полное runtime-
 миграционной телеметрией и проверка побайтного fingerprint ядра плюс
 production-генерации на старом checkpoint. Мастер и существующий
 `ziwago_v19_bankfixed_20261109.pt` не изменялись.
+
+## Дополнение: фиксы обзора и текущий phase-router baseline — 2026-11-15
+
+Точный targeted набор текущего прохода:
+
+```powershell
+python -m pytest -q tests/test_v20_cortical_clock.py tests/test_v20_organism_composition.py tests/test_v22_astrocyte_wiring.py tests/test_v22_restore_chemistry_migration.py tests/test_volume_chemistry.py tests/test_v22_beam_state_isolation.py tests/test_v22_checkpoint_hash_pin.py
+```
+
+Фактический результат: `74 passed, 1 warning, 8 subtests passed in 81.38s`,
+код завершения 0. Предупреждение — `torch.frombuffer` сообщает о read-only
+buffer в `_readonly_checkpoint_mapping`; проверенный loader и его TOCTOU-тест
+успешны. Запуск покрывает hash-pinned загрузку и требование явного trust для
+legacy pickle, restore с `IntegrationConfig`, транзакционную router telemetry,
+Ca-baseline и migration старого накопленного порога, beam branch-order
+independence и recurrent-resource restore без active ejection/integrated clock,
+inference decay, volume eCB/H₂S routing и дендритный teaching signal. Это
+focused набор, не полный suite.
+
+Отдельный замер текущего CPU phase-router выполнен на Windows-хосте
+`AMD Ryzen 7 3700X`, PyTorch `2.14.1+cu130`, с 15.94 GiB физической RAM.
+CUDA доступна, но не использовалась: router измерялся на CPU, `torch` ограничен
+одним потоком. Конфигурация: 16 колонок, ring length 64, seed 7; 20 прогревочных
+шагов и 5 пакетов по 200 шагов. Медиана — **29.4884 ms/step**, диапазон пакетов
+**29.3403–29.5312 ms/step**. Это локальный microbenchmark текущей реализации,
+не end-to-end generation профиль и не сравнение оптимизированного кандидата.
+Повторить измерение можно таким PowerShell-командным блоком:
+
+```powershell
+@'
+import statistics
+import time
+import torch
+from ziwago.cortex.moe_cortex import ReferenceInvariantLagPLVRouter
+
+torch.set_num_threads(1)
+router = ReferenceInvariantLagPLVRouter(n_columns=16, ring_len=64, seed=7)
+rates = torch.linspace(0.01, 0.2, 16)
+for _ in range(20):
+    router.step_phases_and_compute_causal_matrix(rates)
+measurements = []
+steps = 200
+for _ in range(5):
+    start = time.perf_counter()
+    for _ in range(steps):
+        router.step_phases_and_compute_causal_matrix(rates)
+    measurements.append((time.perf_counter() - start) * 1000.0 / steps)
+print({
+    "device": "cpu",
+    "n_columns": 16,
+    "steps_per_batch": steps,
+    "batches": len(measurements),
+    "median_ms_per_step": round(statistics.median(measurements), 4),
+    "range_ms_per_step": [round(min(measurements), 4), round(max(measurements), 4)],
+    "cuda_available": torch.cuda.is_available(),
+})
+'@ | python -
+```
+
+Векторизация не выполнялась: этот baseline лишь фиксирует измеряемую стоимость.
+Snapshot/load, sleep и replay всё ещё не имеют текущего wall-clock замера; для
+них нужен отдельный воспроизводимый сценарий и сравнение точного состояния до
+оптимизации.

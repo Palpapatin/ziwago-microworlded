@@ -140,7 +140,8 @@ class CorticalColumn:
         self._loc_c2 = 0.94e-4
 
     def _advance_synaptic_clock(self, x_ff: torch.Tensor, x_fb: torch.Tensor,
-                                x_rec: torch.Tensor, s_post: torch.Tensor) -> None:
+                                x_rec: torch.Tensor, s_post: torch.Tensor,
+                                decay_weights: bool = True) -> None:
         """One v20 tick, after forward (zero activity for dormant columns).
 
         BCM uses a column-local mean-square population rate, smoothed on the
@@ -153,7 +154,8 @@ class CorticalColumn:
         )
         for syn, pre in ((self.w_ff, x_ff), (self.w_fb, x_fb), (self.w_rec, x_rec)):
             syn.theta_m = syn.cfg.theta_m0 + self._bcm_post_activity
-            syn.advance_time(dt=1.0, s_pre=pre, s_post=s_post)
+            syn.advance_time(dt=1.0, s_pre=pre, s_post=s_post,
+                             decay_weights=decay_weights)
 
     # ------------------------------------------------------------------
     def _ensure_astrocyte(self):
@@ -312,7 +314,8 @@ class CorticalColumn:
         self.lfp.step(self.pyr.last_i_ff, self.pyr.last_i_fb,
                       self.pyr.last_i_inh, dt=dt)
         if external:
-            self._advance_synaptic_clock(x_ff, x_fb, pyr_s, out.s)
+            self._advance_synaptic_clock(x_ff, x_fb, pyr_s, out.s,
+                                         decay_weights=learn)
         self._last_s = out.s
         self._last_x_ff = x_ff.detach()
         self._last_x_fb = x_fb.detach()
@@ -371,6 +374,8 @@ class CorticalColumn:
                 synaptic_rows_updated += int(changed.any(dim=1).sum().item())
                 synaptic_weight_updates += int(changed.sum().item())
             ap_err_step = ((self.pyr.v_a - self.pyr.cfg.e_l) / 25.0).clamp(-1.5, 1.5)
+            # The tree records the prior-cycle soma target in step(); this
+            # same-cycle neuron error is the owning column's teaching signal.
             self.dendrite.learn(effective_error, x_ff, apical_error=ap_err_step,
                                 f_mod=effective_f_mod)
             # Узел 4: Бодрствующий структурный морфогенез при высокой ошибке и всплеске BDNF

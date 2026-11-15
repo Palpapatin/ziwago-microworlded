@@ -469,7 +469,24 @@ class IntegratedOrganism:
                 "agents": asdict(self.xchem.l),
                 "no_mean": float(self.volume.no.mean()),
                 "h2s_mean": float(self.volume.h2s.mean()),
-                "ecb_mean": float(self.volume.ecb_field.mean())}
+                "ecb_mean": float(self.volume.ecb_field.mean()),
+                "field_consumers": {
+                    "volume_no_ltp": {
+                        "connected": True,
+                        "path": "VolumeTransmission.zone_fields.no_ltp -> "
+                                "column._no_ltp_field -> GenesisSynapse.learn",
+                    },
+                    "volume_ecb": {
+                        "connected": True,
+                        "path": "VolumeTransmission.last_eject -> column._vol_eject "
+                                "-> recurrent synapse resource u_syn",
+                        "limitation": "does not directly scale presynaptic release",
+                    },
+                    "volume_h2s": {
+                        "connected": False,
+                        "reason": "VolumeTransmission.h2s has no live cortical consumer",
+                    },
+                }}
 
     def _update_limbic(self, bundle, relay, plastic):
         # Opt-in (М-8): BLA/CeA валентность → фазический DA (3-й фактор пластичности).

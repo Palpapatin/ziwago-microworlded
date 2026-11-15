@@ -67,7 +67,8 @@ class DendriticTree:
         # ADCG: проекция апикального контекста на пороги 7 ветвей
         self.w_apical_gate = torch.randn(self.n, self.k, generator=g) * 0.25
 
-        self.theta_ca = float(theta_ca)
+        self.theta_ca_base = float(theta_ca)
+        self.theta_ca = self.theta_ca_base
         self.plateau_ms = float(plateau_ms)
         self.bac_window = float(bac_window)
         self.theta_drop = float(theta_drop)
@@ -78,6 +79,9 @@ class DendriticTree:
         self.reset_state(1)
 
     def reset_state(self, batch: int, device=None, dtype=torch.float32) -> None:
+        if not hasattr(self, "theta_ca_base"):
+            self.theta_ca_base = float(self.theta_ca)
+        self.theta_ca = self.theta_ca_base
         z = lambda *s: torch.zeros(batch, *s, device=device, dtype=dtype)
         self.branch_v = z(self.n, self.k).fill_(-70.0)
         self.plateau = z(self.n, self.k)
@@ -186,21 +190,27 @@ class DendriticTree:
         return self._last_somatic_target - self._last_somatic_pred
 
     def apply_theta_ca_shift(self, shift: float) -> float:
-        """Применить конечный внешний Ca²⁺-сдвиг к порогу дендрита."""
+        """Set the current Ca²⁺ threshold relative to its unmodulated baseline."""
         if not math.isfinite(shift):
             raise ValueError("theta_ca shift must be finite.")
-        self.theta_ca += float(shift)
+        if not hasattr(self, "theta_ca_base"):
+            self.theta_ca_base = float(self.theta_ca)
+        self.theta_ca = self.theta_ca_base + float(shift)
         return self.theta_ca
 
     def learn(self, error: Optional[torch.Tensor], x_in: torch.Tensor,
               apical_error: Optional[torch.Tensor] = None,
               f_mod: float = 1.0, eta: float = 1.5e-3) -> float:
         r"""Локальная трёхфакторная пластичность 7-уровневого дендритного дерева (Poirazi 2003; Beniaguev 2021):
-        Объединяет ошибку предсказания на уровне сомы (`error = S_i - φ(V*_D,i)`) и ошибку
-        на уровне апикального дендрита (`apical_error`), обновляя:
+        Объединяет соматический teaching-сигнал и ошибку на уровне апикального
+        дендрита (`apical_error`), обновляя:
           1) веточно-соматические веса $\alpha_{i,k}$ `[N, K]`;
           2) синаптические веса 7 дендритных ветвей $W_{\text{syn}}$ `[K, D]`;
-          3) апикально-дендритные гейты контекста $W_{\text{apical\_gate}}$ `[N, K]`."""
+          3) апикально-дендритные гейты контекста $W_{\text{apical\_gate}}$ `[N, K]`.
+
+        `error` may be a same-tick teaching signal from the owning column; when
+        omitted, the tree uses its own last-step somatic prediction error.
+        """
         if f_mod <= 0.0 or not hasattr(self, "_last_branch_act"):
             return 0.0
         if error is None:

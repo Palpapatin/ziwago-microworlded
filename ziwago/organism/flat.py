@@ -3363,12 +3363,42 @@ class ZiwagoPureSynapticDialogueOrganismV14:
                                     "cortex_tick_after": chem_tick,
                                     "owner": "chemistry.tick"}
         completed = 0
+        migrated_theta_baselines = []
         for column in getattr(self.moe_cortex, "columns", []):
             if hasattr(column, "_ensure_astrocyte") and not hasattr(column, "astrocyte"):
                 column._ensure_astrocyte()
                 completed += 1
+        reconciled_theta_thresholds = []
+        for column_index, column in enumerate(getattr(self.moe_cortex, "columns", [])):
+            dendrite = getattr(column, "dendrite", None)
+            if dendrite is not None and not hasattr(dendrite, "theta_ca_base"):
+                dendrite.theta_ca_base = float(dendrite.theta_ca)
+                migrated_theta_baselines.append(column_index)
+            if dendrite is not None:
+                astrocyte = column._ensure_astrocyte() if hasattr(column, "_ensure_astrocyte") else None
+                shift = float(astrocyte.theta_ca_shift()) if astrocyte is not None else 0.0
+                expected_theta = float(dendrite.theta_ca_base) + shift
+                if not math.isclose(float(dendrite.theta_ca), expected_theta,
+                                    rel_tol=0.0, abs_tol=1e-6):
+                    previous_theta = float(dendrite.theta_ca)
+                    dendrite.apply_theta_ca_shift(shift)
+                    reconciled_theta_thresholds.append({
+                        "column": column_index,
+                        "previous": previous_theta,
+                        "baseline": float(dendrite.theta_ca_base),
+                        "restored_shift": shift,
+                        "current": float(dendrite.theta_ca),
+                    })
         if completed:
             report["columns_completed"] = completed
+        if migrated_theta_baselines:
+            report["dendrite_theta_ca_baseline"] = {
+                "columns": migrated_theta_baselines,
+                "source": "restored_theta_ca",
+                "reason": "legacy checkpoints lack an unmodulated threshold baseline",
+            }
+        if reconciled_theta_thresholds:
+            report["dendrite_theta_ca_reconciled"] = reconciled_theta_thresholds
         self.restore_migrations = report
         return report
 

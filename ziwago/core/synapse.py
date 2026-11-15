@@ -428,7 +428,8 @@ class GenesisSynapse:
 
     def advance_time(self, dt: float = 1.0,
                      s_pre: Optional[torch.Tensor] = None,
-                     s_post: Optional[torch.Tensor] = None) -> None:
+                     s_post: Optional[torch.Tensor] = None,
+                     decay_weights: Optional[bool] = None) -> None:
         """External elapsed-time update, after forward and before any teaching.
 
         Pre/post activity enters traces once here, even without teaching. Only
@@ -457,7 +458,10 @@ class GenesisSynapse:
         plastic = ((self.scaffold_state == SCAFFOLD_PLASTIC)
                    if self.enable_scaffold else torch.ones_like(self.mask))
         # Frozen evaluation must not erode learned weights; traces still age.
-        if bool(getattr(self, "learning_enabled", True)):
+        should_decay_weights = bool(getattr(self, "learning_enabled", True))
+        if decay_weights is not None:
+            should_decay_weights = should_decay_weights and bool(decay_weights)
+        if should_decay_weights:
             self.w_fast.mul_(torch.where(plastic, 0.9995 ** dt, 1.0))
             self.w_slow.mul_(torch.where(plastic, c.decay ** dt, 1.0))
         gln_rate = float(getattr(self, "glutamine_rate", 1.0))

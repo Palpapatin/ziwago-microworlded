@@ -507,23 +507,38 @@ ight) = \sin\!\Big(	ilde{\phi}_j(t) - 	ilde{\phi}_i(t - 	au_{ij})\Big)$$
         saved_abs = self.ema_abs_im_sum.clone()
         saved_sq = self.ema_im_sq_sum.clone()
         saved_dtf = self.directed_transfer_matrix.clone()
+        saved_raw_plv = self.last_raw_zero_lag_plv
+        saved_lag_dwpli = self.last_lag_dwpli
 
-        test_rates = torch.tensor([0.12, 0.04, 0.18, 0.02, 0.15, 0.05, 0.09, 0.11])
-        mat_ref0 = self.step_phases_and_compute_causal_matrix(test_rates, common_reference_offset=0.0)
-        dwpli_ref0 = self.last_lag_dwpli
+        try:
+            test_rates = torch.tensor([0.12, 0.04, 0.18, 0.02, 0.15, 0.05, 0.09, 0.11])
+            mat_ref0 = self.step_phases_and_compute_causal_matrix(
+                test_rates, common_reference_offset=0.0)
+            dwpli_ref0 = self.last_lag_dwpli
 
-        # Восстанавливаем состояние и подаём огромный сдвиг общего электрода сравнения (+2.45 радиан)
-        self.ptr = saved_ptr
-        self.phase_ring.copy_(saved_phase)
-        self.rate_ring.copy_(saved_rate)
-        self.ema_im_sum.copy_(saved_im)
-        self.ema_abs_im_sum.copy_(saved_abs)
-        self.ema_im_sq_sum.copy_(saved_sq)
-        self.directed_transfer_matrix.copy_(saved_dtf)
+            # Compare both sweeps from the same state.
+            self.ptr = saved_ptr
+            self.phase_ring.copy_(saved_phase)
+            self.rate_ring.copy_(saved_rate)
+            self.ema_im_sum.copy_(saved_im)
+            self.ema_abs_im_sum.copy_(saved_abs)
+            self.ema_im_sq_sum.copy_(saved_sq)
+            self.directed_transfer_matrix.copy_(saved_dtf)
 
-        mat_ref_shifted = self.step_phases_and_compute_causal_matrix(test_rates, common_reference_offset=2.45)
-        dwpli_shifted = self.last_lag_dwpli
-        invariance_error = float((mat_ref0 - mat_ref_shifted).abs().max().item())
+            mat_ref_shifted = self.step_phases_and_compute_causal_matrix(
+                test_rates, common_reference_offset=2.45)
+            dwpli_shifted = self.last_lag_dwpli
+            invariance_error = float((mat_ref0 - mat_ref_shifted).abs().max().item())
+        finally:
+            self.ptr = saved_ptr
+            self.phase_ring.copy_(saved_phase)
+            self.rate_ring.copy_(saved_rate)
+            self.ema_im_sum.copy_(saved_im)
+            self.ema_abs_im_sum.copy_(saved_abs)
+            self.ema_im_sq_sum.copy_(saved_sq)
+            self.directed_transfer_matrix.copy_(saved_dtf)
+            self.last_raw_zero_lag_plv = saved_raw_plv
+            self.last_lag_dwpli = saved_lag_dwpli
 
         return {
             "dwpli_reference_0": round(dwpli_ref0, 6),
@@ -1423,10 +1438,11 @@ class SparselyGatedCorticalMoE:
         )
         dendrite_fields = (
             "branch_v", "plateau", "bap_time", "bursts", "_last_branch_act", "_last_on",
-            "_last_somatic_pred", "last_ca_spike_fraction", "last_somatic_fep_error",
-            "last_apical_fep_error",
+            "_last_somatic_pred", "_last_somatic_target", "theta_ca", "theta_ca_base",
+            "last_ca_spike_fraction", "last_somatic_fep_error", "last_apical_fep_error",
         )
         synapse_fields = (
+            "stp_gain", "u_syn",
             "last_block_emptiness_ratio", "crossover_density", "last_sparseprop_complexity_ops",
             "last_dense_complexity_ops", "cum_useful_macs", "cum_issued_macs",
             "last_flop_efficiency", "sparseprop_heap",
@@ -1436,9 +1452,12 @@ class SparselyGatedCorticalMoE:
                 "pv", "sst", "vip", "v_pv", "v_sst", "v_vip", "vip_drive", "_last_s",
                 "_last_x_ff", "_last_x_fb", "_last_sst_gate", "_loc_act_mean", "_loc_act_prev1",
                 "_loc_act_prev2", "_loc_c0", "_loc_c1", "_loc_c2", "local_sigma", "last_phase1_stats",
+                "last_local_plasticity_gain", "_hipp_in", "_last_resid", "_vol_eject",
+                "_no_ltp_field",
             ))
             paths.extend(("columns", cid, "pyr", name) for name in neuron_fields)
             paths.extend(("columns", cid, "dendrite", name) for name in dendrite_fields)
+            paths.append(("columns", cid, "astrocyte", "ca"))
             paths.extend(("columns", cid, "lfp", name) for name in (
                 "layer_lfp", "history", "ephaptic_mv",
             ))
@@ -1452,10 +1471,6 @@ class SparselyGatedCorticalMoE:
             ))
             for synapse_name in ("w_ff", "w_fb", "w_rec"):
                 paths.extend(("columns", cid, synapse_name, name) for name in synapse_fields)
-            vol_eject = getattr(col, "_vol_eject", None)
-            if (vol_eject is not None and vol_eject.numel() == col.zcfg.n_neurons
-                    and float(vol_eject.max().item()) > 0.0):
-                paths.append(("columns", cid, "w_rec", "u_syn"))
         if getattr(self, "integrated_clock_enabled", False):
             for cid, col in enumerate(self.columns):
                 paths.extend(("columns", cid, name) for name in ("_mod_ctx", "_bcm_post_activity"))
@@ -1464,7 +1479,7 @@ class SparselyGatedCorticalMoE:
                     syn = getattr(col, synapse_name)
                     fields = ["externally_clocked", "learning_enabled", "theta_m", "_tag_ref_ready",
                               "tag", "eligibility", "z_pre", "z_post", "r_err", "r_pre",
-                              "spine_age", "spine_health", "u_syn", "chabc_window_ticks"]
+                              "spine_age", "spine_health", "chabc_window_ticks"]
                     if getattr(syn, "enable_het_syn", False):
                         fields += ["het_trace", "tau_syn_het", "pre_isi_ema", "pre_silence_ticks"]
                     paths.extend(("columns", cid, synapse_name, name) for name in fields)

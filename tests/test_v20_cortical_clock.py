@@ -171,12 +171,23 @@ def test_epoch_kl_snapshot_is_explicit_and_still_measures_weight_drift():
     assert syn.kl_divergence_bits() > 0.0
 
 
+def test_routing_telemetry_restores_router_state_even_after_second_sweep():
+    cortex = _moe()
+    cortex.lag_plv_router.step_phases_and_compute_causal_matrix(torch.tensor([0.2, 0.7]))
+    before = cortex.export_state_dict()
+
+    report = cortex.routing_telemetry()
+
+    assert report["reference_sweep_invariance_check"]["is_reference_invariant"]
+    _assert_tree_equal(before, cortex.export_state_dict())
+
+
 @pytest.mark.parametrize("fault", ["tick", "dt"])
 def test_context_clock_validation_precedes_all_mutation(fault):
     cortex = _moe()
     ctx = _context(1)
     if fault == "tick":
-        ctx["tick"] = 2
+        ctx["tick"] = 0
     else:
         cortex.columns[1].pyr.cfg.dt = 0.5
     before = cortex.export_state_dict()
@@ -375,6 +386,25 @@ def test_external_learning_keeps_activity_driven_resource_spend():
     torch.testing.assert_close(syn.u_syn, torch.full_like(syn.u_syn, 0.5 + 0.5 / 500.0 - 0.15))
     torch.testing.assert_close(syn.z_pre, torch.ones_like(syn.z_pre))
     torch.testing.assert_close(syn.z_post, torch.ones_like(syn.z_post))
+
+
+def test_nonlearning_clock_advances_traces_without_decaying_learned_weights():
+    syn = _syn()
+    syn.w_slow.fill_(0.4)
+    syn.w_fast.fill_(0.2)
+    slow_before = syn.w_slow.clone()
+    fast_before = syn.w_fast.clone()
+
+    syn.advance_time(
+        s_pre=torch.ones(1, 2),
+        s_post=torch.ones(1, 1),
+        decay_weights=False,
+    )
+
+    assert torch.equal(syn.w_slow, slow_before)
+    assert torch.equal(syn.w_fast, fast_before)
+    assert torch.equal(syn.z_pre, torch.ones_like(syn.z_pre))
+    assert torch.equal(syn.z_post, torch.ones_like(syn.z_post))
 
 
 def test_signed_external_da_reaches_delayed_eligibility_even_in_silence():

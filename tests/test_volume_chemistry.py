@@ -23,6 +23,7 @@ from __future__ import annotations
 import sys
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 
 import torch
 
@@ -128,6 +129,35 @@ class VolumeFieldTests(unittest.TestCase):
         self.assertEqual(len(vt["agents"]), 22)
         for key in ("no_mean", "h2s_mean", "ecb_mean", "nmda_gain", "p_release_scale"):
             self.assertIn(key, vt)
+        self.assertTrue(vt["field_consumers"]["volume_ecb"]["connected"])
+        self.assertFalse(vt["field_consumers"]["volume_h2s"]["connected"])
+
+    def test_ejection_is_causally_driven_by_ecb_and_h2s_is_not_routed(self):
+        def run(ecb_level):
+            core = tiny_core()
+            core.enable_integrated_organism(
+                config=IntegrationConfig(volume_chemistry_enabled=True))
+            col = core.moe_cortex.columns[0]
+            volume = core.life.volume
+            volume.ecb_field[:32].fill_(ecb_level)
+            volume.attract_dur[:32].fill_(200.0)
+            col._last_s = torch.ones(1, 32)
+            core.life._distribute_volume_fields(
+                core, SimpleNamespace(active_expert_ids=[0]))
+            before = col.w_rec.u_syn.clone()
+            col.step(torch.ones(1, 64) * 0.1, torch.zeros(1, 32),
+                     f_mod=0.0, vip_mod=0.0, learn=False)
+            return col, before
+
+        control, control_before = run(0.0)
+        ecb, ecb_before = run(0.8)
+        self.assertLess(float(control._vol_eject.max()), float(ecb._vol_eject.max()))
+        self.assertGreater(float(ecb._vol_eject.max()), 0.0)
+        self.assertTrue(bool((control.w_rec.u_syn <= control_before).all()))
+        self.assertTrue(bool((ecb.w_rec.u_syn[:32] < control.w_rec.u_syn[:32]).any()))
+        self.assertTrue(bool((ecb.w_rec.u_syn < ecb_before).any()))
+        self.assertFalse(hasattr(ecb, "_vol_h2s"))
+        self.assertFalse(hasattr(ecb, "_vol_ecb_field"))
 
 
 if __name__ == "__main__":

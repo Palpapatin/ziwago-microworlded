@@ -22,6 +22,7 @@ if str(ROOT) not in sys.path:
 
 from test_v19_spiking_language import tiny_core
 import ziwago.organism_core as flatmod
+from ziwago.organism.integrated import IntegrationConfig
 from ziwago.organism.verified import V19_SCHEMA, validate_v19_envelope
 
 ZiwagoOrganism = flatmod.ZiwagoOrganism
@@ -85,6 +86,58 @@ class FlatV20Tests(unittest.TestCase):
         self.assertIsInstance(flat.export_genesis_state_dict(), dict)
         self.assertIsInstance(flat.export_v19_state(), dict)
         self.assertIsInstance(flat.core_organism.export_runtime_state(), dict)
+
+    def test_explicit_config_does_not_replace_restored_integrated_state(self):
+        import tempfile
+
+        config = IntegrationConfig(ticks_per_token=2)
+        restored_life = []
+
+        def fake_consume(self, path, expected_sha256, consumer, **kwargs):
+            return consumer({"v20_schema_version": flatmod.V20_SCHEMA})
+
+        def fake_restore(self, path, payload):
+            life = self.core_organism.life
+            restored_life.append(life)
+            life.replay = [{
+                "cue": torch.ones(64),
+                "priority": 0.8,
+                "columns": [],
+            }]
+            life.actions.pending = {"decision_id": "restored", "action": 2}
+            life.action_result = {
+                "action": 2, "committed": True,
+                "decision_id": "restored", "bg_release": 0.4,
+            }
+            life.criticality = {
+                "available": True, "estimate": 0.91, "reason": "measured",
+            }
+            life.criticality_gain = 1.23
+
+        with tempfile.TemporaryDirectory() as tmp:
+            checkpoint = Path(tmp) / "checkpoint.pt"
+            checkpoint.write_bytes(b"mocked checkpoint")
+            with mock.patch.object(flatmod.ZiwagoOrganism, "_consume_checkpoint_payload",
+                                   new=fake_consume), \
+                 mock.patch.object(flatmod.ZiwagoOrganism, "_load_v20_payload",
+                                   new=fake_restore), \
+                 mock.patch.object(flatmod, "ZiwagoPureSynapticDialogueOrganismV14",
+                                   side_effect=lambda **kw: tiny_core()):
+                flat = ZiwagoOrganism(
+                    root=ROOT,
+                    seed=41,
+                    checkpoint_path=checkpoint,
+                    auto_load_checkpoint=True,
+                    integration_config=config,
+                )
+
+        life = flat.core_organism.life
+        self.assertIs(life, restored_life[0])
+        self.assertIs(life.cfg, config)
+        self.assertEqual(len(life.replay), 1)
+        self.assertEqual(life.actions.pending["decision_id"], "restored")
+        self.assertTrue(life.criticality["available"])
+        self.assertEqual(life.criticality_gain, 1.23)
 
     def test_sleep_cycle_v20(self):
         from train_ziwago_v14_pure_synaptic_dialogue import TokenizedDialogPair

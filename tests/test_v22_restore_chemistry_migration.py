@@ -23,6 +23,8 @@ import unittest
 ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
+if str(ROOT / "tests") not in sys.path:
+    sys.path.insert(0, str(ROOT / "tests"))
 
 from ziwago.chemistry.modulators import NeuroChemistry
 from ziwago.config import ChemistryCfg
@@ -94,6 +96,33 @@ class ColumnRestoreCompletionTests(unittest.TestCase):
         from ziwago.organism.flat import ZiwagoPureSynapticDialogueOrganismV14 as Organism
         self.assertTrue(hasattr(Organism, "apply_restore_migrations"),
                         "миграции после восстановления должны быть одной точкой")
+
+    def test_legacy_dendrite_threshold_baseline_migration_is_reported(self):
+        from test_v19_spiking_language import tiny_core
+
+        core = tiny_core()
+        dendrite = core.moe_cortex.columns[0].dendrite
+        dendrite.theta_ca = -31.0
+        del dendrite.theta_ca_base
+
+        report = core.apply_restore_migrations()
+
+        self.assertEqual(dendrite.theta_ca_base, -31.0)
+        self.assertEqual(report["dendrite_theta_ca_baseline"]["columns"], [0])
+
+    def test_accumulated_legacy_threshold_is_reconciled_to_restored_calcium(self):
+        from test_v19_spiking_language import tiny_core
+
+        core = tiny_core()
+        column = core.moe_cortex.columns[0]
+        column.dendrite.theta_ca_base = -25.0
+        column.dendrite.theta_ca = -33.0
+        column.astrocyte.ca.fill_(0.5)
+
+        report = core.apply_restore_migrations()
+
+        self.assertAlmostEqual(column.dendrite.theta_ca, -27.0, places=6)
+        self.assertEqual(report["dendrite_theta_ca_reconciled"][0]["previous"], -33.0)
 
 
 if __name__ == "__main__":

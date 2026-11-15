@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import torch
+from unittest.mock import patch
 
 from ziwago.config import USNeuronCfg, USSynapseCfg, ZoneCfg
 from ziwago.core.dendrite import DendriticTree
@@ -62,3 +63,29 @@ def test_astrocyte_theta_ca_shift_is_applied_to_dendrite_and_ca_is_initialized_i
     shift = astro.apply_theta_ca_shift(tree)
     assert float(tree.theta_ca) == base + shift
     assert shift < 0.0
+
+
+def test_astrocyte_threshold_is_absolute_and_reset_returns_to_baseline():
+    tree = DendriticTree(n_neurons=2, n_in=4, n_branch=3, seed=1)
+    base = tree.theta_ca_base
+    for shift in (-0.5, -1.0, -0.5, 0.0):
+        assert tree.apply_theta_ca_shift(shift) == base + shift
+    tree.apply_theta_ca_shift(-2.0)
+    tree.reset_state(1)
+    assert tree.theta_ca == base
+
+
+def test_column_routes_same_tick_neuron_error_to_dendritic_learning():
+    col = _column()
+    x_ff = torch.ones(1, 4)
+    x_fb = torch.zeros(1, 8)
+    with patch.object(col.dendrite, "learn", wraps=col.dendrite.learn) as learn:
+        out = col.step(x_ff, x_fb, f_mod=1.0, vip_mod=0.0, learn=True)
+
+    learning_error = learn.call_args.args[0]
+    torch.testing.assert_close(
+        learning_error,
+        out.error * col.last_local_plasticity_gain,
+        rtol=0.0,
+        atol=0.0,
+    )

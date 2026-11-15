@@ -14,6 +14,7 @@ a sibling `organism.py` module would collide with it.
 from __future__ import annotations
 
 import copy
+import gc
 import hashlib
 import io
 import math
@@ -175,27 +176,35 @@ class ZiwagoOrganism:
         self.core_organism.external_grounding_verifier_fn = self.authority.ground
         self.core_organism.external_think_resolver_fn = self._resolve_cortical_think_concept
         self.core_organism.online_learning_enabled = False
+        # Configure the live driver before restoring a checkpoint. An explicit
+        # config may replace the fresh driver, but must not replace restored state.
+        self.core_organism.enable_integrated_organism(integration_config, physiology_config)
         # Clean Slate (H1): no master fallback. checkpoint_path=None → fresh organism
         # (v20 trains from scratch); the archived v18 master is never auto-loaded.
         if auto_load_checkpoint and checkpoint_path:
             path = Path(checkpoint_path)
             if not path.is_file():
                 raise CheckpointCompatibilityError(f"Checkpoint missing: {path}")
-            payload = self._load_checkpoint_payload(path, expected_checkpoint_sha256)
-            if payload.get("v20_schema_version") is not None:
-                self._load_v20_payload(path, payload)
-            elif payload.get("v19_schema_version") == V19_SCHEMA:
-                self._load_v19_payload(path, payload)
-            else:
-                self.core_organism.load_self_contained_checkpoint(path, preloaded_payload=payload)
-                state = payload.get("genesis_v18_state")
-                if isinstance(state, dict):
-                    self.load_genesis_state_dict(state)
-                self.baseline_sha256 = expected_checkpoint_sha256 or file_sha256(path)
-                self.core_organism.dialogue_state.reset_session()
-                self.loaded_checkpoint_info = {"migration": "legacy assertions quarantined", "source_sha256": self.baseline_sha256}
-                self._register_foundation_sources()
-                self.ingest_parsed_knowledge()
+            def restore_payload(payload):
+                if payload.get("v20_schema_version") is not None:
+                    self._load_v20_payload(path, payload)
+                elif payload.get("v19_schema_version") == V19_SCHEMA:
+                    self._load_v19_payload(path, payload)
+                else:
+                    self.core_organism.load_self_contained_checkpoint(path, preloaded_payload=payload)
+                    state = payload.get("genesis_v18_state")
+                    if isinstance(state, dict):
+                        self.load_genesis_state_dict(state)
+                    self.baseline_sha256 = expected_checkpoint_sha256 or file_sha256(path)
+                    self.core_organism.dialogue_state.reset_session()
+                    self.loaded_checkpoint_info = {
+                        "migration": "legacy assertions quarantined",
+                        "source_sha256": self.baseline_sha256,
+                    }
+                    self._register_foundation_sources()
+                    self.ingest_parsed_knowledge()
+            self._consume_checkpoint_payload(
+                path, expected_checkpoint_sha256, restore_payload)
 
         # ── ЕДИНЫЙ КОНТУР (13.11.2026) ───────────────────────────────────────
         # Контур организма всегда биологический: таламус/TRN/AST/GW/критичность/
@@ -206,7 +215,6 @@ class ZiwagoOrganism:
         # v20_schema), которые выбираются по содержимому payload, а не флагом.
         # Версия контура — всегда 20.0; версия схемы чекпоинта — отдельное поле.
         self.version = "20.0"
-        self.core_organism.enable_integrated_organism(integration_config, physiology_config)
         self.core_organism.external_sleep_phase_fn = self._on_sleep_phase
         self.core_organism.life.sleep_report = getattr(self.core_organism.life, "sleep_report", {})
 
@@ -333,21 +341,41 @@ class ZiwagoOrganism:
             self.content_form_role_dictionary = restored
             self.core_organism.role_filler_binder.role_dictionary = restored
 
-    def load_genesis_checkpoint(self, path: Path, strict_schema: bool = True) -> Dict[str, object]:
+    def load_genesis_checkpoint(
+        self,
+        path: Path,
+        strict_schema: bool = True,
+        *,
+        expected_checkpoint_sha256: Optional[str] = None,
+        trusted_legacy_pickle: bool = False,
+    ) -> Dict[str, object]:
         """Загружает единый самодостаточный чекпоинт ядра `v16.2` и всех 5 столпов `Genesis v18.1` за один вызов `torch.load`!"""
         ckpt_p = resolve_master_checkpoint_path(explicit_path=Path(path))
-        payload = torch.load(ckpt_p, map_location="cpu", weights_only=False)
-        val_info = self.core_organism.load_self_contained_checkpoint(
+        if trusted_legacy_pickle and expected_checkpoint_sha256 is None:
+            raise CheckpointCompatibilityError(
+                "Trusted legacy pickle loading requires an expected SHA-256."
+            )
+
+        def restore_payload(payload):
+            val_info = self.core_organism.load_self_contained_checkpoint(
+                ckpt_p,
+                strict_schema=strict_schema,
+                preloaded_payload=payload,
+            )
+            gen_state = payload.get("genesis_v18_state")
+            if isinstance(gen_state, dict):
+                self.load_genesis_state_dict(gen_state)
+                self.loaded_genesis_state_from_ckpt = True
+            self.loaded_checkpoint_info = val_info
+            return val_info
+
+        return self._consume_checkpoint_payload(
             ckpt_p,
-            strict_schema=strict_schema,
-            preloaded_payload=payload,
+            expected_checkpoint_sha256,
+            restore_payload,
+            weights_only=not trusted_legacy_pickle,
+            trusted_legacy_pickle=trusted_legacy_pickle,
         )
-        gen_state = payload.get("genesis_v18_state")
-        if isinstance(gen_state, dict):
-            self.load_genesis_state_dict(gen_state)
-            self.loaded_genesis_state_from_ckpt = True
-        self.loaded_checkpoint_info = val_info
-        return val_info
 
     # ── v19 methods (not overridden by v20) ───────────────────────────────────
     def _rem_dream(self) -> Dict[str, object]:
@@ -611,30 +639,73 @@ class ZiwagoOrganism:
         self.load_v19_state(payload["v19_state"])
         self.loaded_checkpoint_info = {"schema": V19_SCHEMA, "certification": payload.get("certification")}
 
-    def _load_checkpoint_payload(self, path: Path, expected_checkpoint_sha256: Optional[str] = None) -> dict:
+    def _consume_checkpoint_payload(
+        self,
+        path: Path,
+        expected_checkpoint_sha256: Optional[str],
+        consumer: Callable[[dict], object],
+        *,
+        weights_only: bool = True,
+        trusted_legacy_pickle: bool = False,
+    ):
+        path = Path(path)
+        if not callable(consumer):
+            raise TypeError("consumer must be callable.")
+        if not weights_only and (
+            not trusted_legacy_pickle or expected_checkpoint_sha256 is None
+        ):
+            raise CheckpointCompatibilityError(
+                "Unrestricted pickle loading requires explicit trust and an expected SHA-256."
+            )
+
         if expected_checkpoint_sha256 is None:
-            # READONLY-mmap обязателен: без mmap весь чекпоинт (4.5 ГБ) поднимается
-            # в RAM private-копией, поверх организма ~3.9 ГБ -> пик ~8.4 ГБ и OOM.
-            # torch-Windows mmap по умолчанию WRITECOPY (коммитит весь файл); здесь
-            # он подменён на PAGE_READONLY file-backed (~0 commit, evictable).
+            # READONLY-mmap avoids materializing the full checkpoint in RAM.
             with _readonly_checkpoint_mapping():
-                return torch.load(path, map_location="cpu", weights_only=True, mmap=True)
-        with tempfile.TemporaryFile(dir=self.root / "Produce") as snapshot:
+                payload = torch.load(
+                    path, map_location="cpu", weights_only=weights_only, mmap=True)
+            try:
+                return consumer(payload)
+            finally:
+                payload = None
+                gc.collect()
+
+        expected = str(expected_checkpoint_sha256).lower()
+        if len(expected) != 64 or any(ch not in "0123456789abcdef" for ch in expected):
+            raise CheckpointCompatibilityError("Expected checkpoint SHA-256 must be 64 hex characters.")
+
+        snapshot_dir = self.root / "Produce"
+        snapshot_dir.mkdir(parents=True, exist_ok=True)
+        snapshot_path = None
+        payload = None
+        try:
             digest = hashlib.sha256()
-            with path.open("rb") as source:
-                for chunk in iter(lambda: source.read(1024 * 1024), b""):
-                    digest.update(chunk)
-                    snapshot.write(chunk)
-            if digest.hexdigest() != expected_checkpoint_sha256:
-                raise CheckpointCompatibilityError("Checkpoint changed before loading the evaluation snapshot.")
-            snapshot.seek(0)
+            with tempfile.NamedTemporaryFile(
+                dir=snapshot_dir, suffix=".pt", delete=False
+            ) as snapshot:
+                snapshot_path = Path(snapshot.name)
+                with path.open("rb") as source:
+                    for chunk in iter(lambda: source.read(1024 * 1024), b""):
+                        digest.update(chunk)
+                        snapshot.write(chunk)
+            if digest.hexdigest() != expected:
+                raise CheckpointCompatibilityError(
+                    "Checkpoint changed before loading the evaluation snapshot.")
+            # Load the exact file whose bytes were hashed; never reopen the source path.
             with _readonly_checkpoint_mapping():
-                return torch.load(path, map_location="cpu", weights_only=True, mmap=True)
+                payload = torch.load(
+                    snapshot_path, map_location="cpu", weights_only=weights_only, mmap=True)
+            return consumer(payload)
+        finally:
+            payload = None
+            gc.collect()
+            if snapshot_path is not None and snapshot_path.exists():
+                snapshot_path.unlink()
 
     def load_v19_checkpoint(self, path: Path, expected_checkpoint_sha256: Optional[str] = None) -> dict:
         path = Path(path)
-        payload = self._load_checkpoint_payload(path, expected_checkpoint_sha256)
-        self._load_v19_payload(path, payload)
+        self._consume_checkpoint_payload(
+            path, expected_checkpoint_sha256,
+            lambda payload: self._load_v19_payload(path, payload))
         return self.loaded_checkpoint_info
 
     # ── v20 methods (most-derived) ────────────────────────────────────────────
@@ -833,5 +904,7 @@ class ZiwagoOrganism:
 
     def load_v20_checkpoint(self, path, expected_checkpoint_sha256=None):
         path = Path(path)
-        self._load_v20_payload(path, self._load_checkpoint_payload(path, expected_checkpoint_sha256))
+        self._consume_checkpoint_payload(
+            path, expected_checkpoint_sha256,
+            lambda payload: self._load_v20_payload(path, payload))
         return self.loaded_checkpoint_info
