@@ -33,6 +33,22 @@ def _assert_tree_equal(left, right, path="root"):
         assert left == right, f"value mismatch at {path}: {left!r} != {right!r}"
 
 
+def _encoded_object_attributes(value, class_name):
+    if isinstance(value, dict):
+        if value.get("__object__", "").endswith(f":{class_name}"):
+            return value["attributes"]
+        for nested in value.values():
+            found = _encoded_object_attributes(nested, class_name)
+            if found is not None:
+                return found
+    elif isinstance(value, list):
+        for nested in value:
+            found = _encoded_object_attributes(nested, class_name)
+            if found is not None:
+                return found
+    return None
+
+
 def _evaluate_candidate(core, parent_state, candidate):
     core.load_language_dynamic_state(parent_state)
     output = core.life.tick(core, candidate)
@@ -123,3 +139,29 @@ def test_beam_factor_two_is_independent_of_candidate_iteration_order():
 
     _assert_tree_equal(forward, reverse)
     _assert_tree_equal(core_state, core.export_language_dynamic_state())
+
+
+def test_beam_snapshot_keeps_vsa_episode_index_shared_and_out_of_snapshot():
+    torch.set_num_threads(1)
+    core = tiny_core()
+    core.enable_integrated_organism(config=IntegrationConfig(ticks_per_token=1))
+    dht = core.life.hippo.episodic.vsa_dht
+    dht.episodes_vsa[7] = (((1,) * dht.n_blocks,) * dht.n_shards, 0.5)
+
+    snapshot = core.export_language_dynamic_state()
+    episodic_state = _encoded_object_attributes(
+        snapshot["organism"]["values"][0], "Hippocampus")
+
+    assert episodic_state is not None
+    assert "vsa_dht" not in episodic_state
+
+    indexed_episodes = dict(dht.episodes_vsa)
+    core.life.tick(core, torch.ones(core.moe_cortex.n_in))
+    assert dht.episodes_vsa == indexed_episodes
+
+    dht.next_ep_id = 8
+    core.load_language_dynamic_state(snapshot)
+
+    assert core.life.hippo.episodic.vsa_dht is dht
+    assert dht.next_ep_id == 8
+    assert 7 in dht.episodes_vsa

@@ -902,6 +902,8 @@ class SBCVSAShardedHippocampus:
         self.n_blocks = int(n_blocks)
         self.block_len = int(block_len)
         self.shard_capacity = int(shard_capacity)
+        if self.shard_capacity < 1:
+            raise ValueError("shard_capacity must be positive")
         self.n_lsh_buckets = int(n_lsh_buckets)
 
         g = torch.Generator().manual_seed(seed)
@@ -929,6 +931,7 @@ class SBCVSAShardedHippocampus:
         # --- next9.txt #4: HippoRAG Personalized PageRank (Gutierrez et al. 2024, arxiv 2405.14831) ---
         # Разреженный ассоциативный граф поверх SBC-VSA-DHT для многошаговых цепочек (Concept A -> Concept B -> Concept C)
         self.ppr_adj: Dict[int, Dict[int, float]] = {}
+        self._ppr_incoming: Optional[Dict[int, set[int]]] = None
         self.concept_to_episodes: Dict[str, List[int]] = {}
         self.episode_to_concepts: Dict[int, List[str]] = {}
         self.concept_adj: Dict[str, Dict[str, float]] = {}
@@ -998,6 +1001,12 @@ class SBCVSAShardedHippocampus:
     ) -> int:
         """Записывает мультимодальный эпизод параллельно в 4 шарда DHT с ролевым связыванием SBC-VSA
         и автоматически обновляет ассоциативный граф HippoRAG PPR (arxiv 2405.14831)."""
+        while len(self.episodes_vsa) > self.shard_capacity:
+            self._evict_episode(min(self.episodes_vsa))
+        if len(self.episodes_vsa) == self.shard_capacity:
+            oldest_id = self.next_ep_id - self.shard_capacity
+            self._evict_episode(
+                oldest_id if oldest_id in self.episodes_vsa else min(self.episodes_vsa))
         ep_id = self.next_ep_id
         self.next_ep_id += 1
         bound_tuple_list: List[Tuple[int, ...]] = []
@@ -1047,16 +1056,74 @@ class SBCVSAShardedHippocampus:
 
         return ep_id
 
+    def _evict_episode(self, ep_id: int) -> None:
+        slot_codes = self.episode_slot_codes.pop(ep_id, None)
+        self.episodes_vsa.pop(ep_id, None)
+        if slot_codes:
+            for shard_idx, shard in enumerate(self.shard_buckets):
+                filler_code = slot_codes[shard_idx % len(slot_codes)]
+                bucket_ids = {
+                    self._lsh_bucket(filler_code),
+                    (filler_code[4] * 131 + filler_code[5] * 37
+                     + filler_code[6] * 7 + filler_code[7]) % self.n_lsh_buckets,
+                }
+                for bucket_id in bucket_ids:
+                    bucket = shard.get(bucket_id)
+                    if bucket is None:
+                        continue
+                    remaining = [entry for entry in bucket if entry[0] != ep_id]
+                    if remaining:
+                        shard[bucket_id] = remaining
+                    else:
+                        del shard[bucket_id]
+        else:
+            for shard in self.shard_buckets:
+                for bucket_id, bucket in list(shard.items()):
+                    remaining = [entry for entry in bucket if entry[0] != ep_id]
+                    if remaining:
+                        shard[bucket_id] = remaining
+                    else:
+                        del shard[bucket_id]
+        self.shard_counts = [max(0, count - 1) for count in self.shard_counts]
+        incoming = self._ensure_ppr_incoming()
+        for source_id in incoming.pop(ep_id, set()):
+            self.ppr_adj.get(source_id, {}).pop(ep_id, None)
+        neighbors = self.ppr_adj.pop(ep_id, {})
+        for neighbor_id in neighbors:
+            incoming.get(neighbor_id, set()).discard(ep_id)
+        self.episode_to_concepts.pop(ep_id, None)
+        for concept, episode_ids in list(self.concept_to_episodes.items()):
+            remaining_ids = [item for item in episode_ids if item != ep_id]
+            if remaining_ids:
+                self.concept_to_episodes[concept] = remaining_ids
+            else:
+                del self.concept_to_episodes[concept]
+        if self._last_stored_ep_id == ep_id:
+            self._last_stored_ep_id = None
+
     def link_episodes(self, ep_a: int, ep_b: int, weight: float = 0.5, bidirectional: bool = True) -> None:
         """Добавляет взвешенное ассоциативное ребро между двумя эпизодами в графе HippoRAG."""
         if ep_a == ep_b:
             return
         w = max(0.01, float(weight))
+        incoming = self._ensure_ppr_incoming()
         adj_a = self.ppr_adj.setdefault(int(ep_a), {})
         adj_a[int(ep_b)] = max(adj_a.get(int(ep_b), 0.0), w)
+        incoming.setdefault(int(ep_b), set()).add(int(ep_a))
         if bidirectional:
             adj_b = self.ppr_adj.setdefault(int(ep_b), {})
             adj_b[int(ep_a)] = max(adj_b.get(int(ep_a), 0.0), w * 0.85)
+            incoming.setdefault(int(ep_a), set()).add(int(ep_b))
+
+    def _ensure_ppr_incoming(self) -> Dict[int, set[int]]:
+        incoming = getattr(self, "_ppr_incoming", None)
+        if incoming is None:
+            incoming = {}
+            for source_id, neighbors in self.ppr_adj.items():
+                for target_id in neighbors:
+                    incoming.setdefault(target_id, set()).add(source_id)
+            self._ppr_incoming = incoming
+        return incoming
 
     def bind_concept_edge(self, concept_a: str, concept_b: str, weight: float = 0.85) -> None:
         """Связывает два концепта (Concept A -> Concept B) в графе знаний HippoRAG и сшивает их эпизоды."""

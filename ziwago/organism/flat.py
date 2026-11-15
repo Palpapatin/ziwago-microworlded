@@ -7,6 +7,7 @@ train_ziwago_v14_pure_synaptic_dialogue.py (этап B.2). Тренер v14 ре
 """
 from __future__ import annotations
 
+import copy
 from concurrent.futures import ProcessPoolExecutor
 from dataclasses import dataclass, field
 from contextlib import contextmanager
@@ -597,6 +598,36 @@ class ZiwagoPureSynapticDialogueOrganismV14:
         son_paths.extend(("meta_head", name) for name in (
             "w_out", "b_out", "elig", "gw_centroid", "h_state", "trace_gw", "err_hist", "conf_hist",
         ))
+        organism_paths = [
+            ("life",), ("chemistry",),
+            ("son_column", "ast"), ("son_column", "organism_reflection"),
+        ]
+        organism_state = None
+        if hasattr(self, "life"):
+            life = self.life
+            snapshot_life = life
+            hippo = getattr(life, "hippo", None)
+            episodic = getattr(hippo, "episodic", None)
+            if episodic is not None and hasattr(episodic, "vsa_dht"):
+                snapshot_life = copy.copy(life)
+                snapshot_hippo = copy.copy(hippo)
+                snapshot_episodic = copy.copy(episodic)
+                # The VSA episode index is read-only during inference; beam snapshots
+                # must not clone its corpus-sized Python maps for every candidate.
+                del snapshot_episodic.vsa_dht
+                snapshot_hippo.episodic = snapshot_episodic
+                snapshot_life.hippo = snapshot_hippo
+            organism_values = [
+                snapshot_life, self.chemistry,
+                self.son_column.ast,
+                getattr(self.son_column, "organism_reflection",
+                        {"__runtime_path_missing__": True}),
+            ]
+            organism_state = {
+                "runtime_version": 1,
+                "paths": organism_paths,
+                "values": export_runtime_tree(organism_values),
+            }
         return {
             "runtime_version": 19,
             "core": export_runtime_paths(self, [(name,) for name in (
@@ -606,8 +637,7 @@ class ZiwagoPureSynapticDialogueOrganismV14:
             "moe_cortex": self.moe_cortex.export_dynamic_state_dict(),
             "spiking_language_loop": self.spiking_language_loop.export_dynamic_state_dict(),
             "son_column": export_runtime_paths(self.son_column, son_paths),
-            "organism": export_runtime_paths(self, [("life",), ("chemistry",),
-                ("son_column", "ast"), ("son_column", "organism_reflection")]) if hasattr(self, "life") else None,
+            "organism": organism_state,
             "temporal_codec": export_runtime_paths(self.temporal_codec, [
                 ("last_encode_report",), ("last_decode_report",),
             ]),

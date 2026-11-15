@@ -178,6 +178,36 @@ def _dht_with_episodes(n: int = 3):
     return dht, all_codes
 
 
+def test_sbc_vsa_storage_evicts_oldest_episode_at_shard_capacity():
+    dht = SBCVSAShardedHippocampus(n_shards=4, n_blocks=16, block_len=64,
+                                   shard_capacity=3, seed=7)
+    codes = [tuple((i + shard) % dht.block_len for i in range(dht.n_blocks))
+             for shard in range(dht.n_shards)]
+
+    for _ in range(5):
+        dht.store_composite_episode(codes, salience=1.0, concepts=["shared"])
+
+    assert set(dht.episodes_vsa) == {2, 3, 4}
+    assert set(dht.episode_slot_codes) == {2, 3, 4}
+    assert dht.shard_counts == [3] * dht.n_shards
+    assert set(dht.ppr_adj) <= {2, 3, 4}
+    assert all(neighbor in {2, 3, 4}
+               for links in dht.ppr_adj.values() for neighbor in links)
+    assert all(episode_id in {2, 3, 4}
+               for episodes in dht.shard_buckets
+               for bucket in episodes.values()
+               for episode_id, _, _ in bucket)
+    assert dht.concept_to_episodes["shared"] == [2, 3, 4]
+
+    dht.link_episodes(2, 4, bidirectional=False)
+    dht.store_composite_episode(codes, salience=1.0, concepts=["shared"])
+
+    assert set(dht.episodes_vsa) == {3, 4, 5}
+    assert all(2 not in links for links in dht.ppr_adj.values())
+    assert 2 not in dht.ppr_adj
+    assert dht.concept_to_episodes["shared"] == [3, 4, 5]
+
+
 def test_sequence_retrieval_accuracy_is_not_invented():
     """Ground truth для «правильной последовательности» в этой функции нет —
     честный ответ `None` + флаг, а не литеральная константа 0.96."""
