@@ -63,13 +63,13 @@ class JOBOBJECT_EXTENDED_LIMIT_INFORMATION(ctypes.Structure):
 
 
 class JOBOBJECT_CPU_RATE_CONTROL_INFORMATION(ctypes.Structure):
-    _fields_ = [("ControlFlags", wintypes.DWORD),
-                ("Anonymous", ctypes.c_ulonglong),
-                ("CpuRate", wintypes.DWORD),
-                ("Weight", wintypes.DWORD)]
+    class RATE_CONTROL(ctypes.Union):
+        _fields_ = [("CpuRate", wintypes.DWORD), ("Weight", wintypes.DWORD)]
+
+    _fields_ = [("ControlFlags", wintypes.DWORD), ("RateControl", RATE_CONTROL)]
 
 
-def total_physical_memory() -> int:
+def total_physical_memory() -> tuple[int, int]:
     class MEMORYSTATUSEX(ctypes.Structure):
         _fields_ = [("dwLength", wintypes.DWORD), ("dwMemoryLoad", wintypes.DWORD),
                     ("ullTotalPhys", ctypes.c_ulonglong), ("ullAvailPhys", ctypes.c_ulonglong),
@@ -78,7 +78,11 @@ def total_physical_memory() -> int:
                     ("ullAvailExtendedVirtual", ctypes.c_ulonglong)]
     status = MEMORYSTATUSEX()
     status.dwLength = ctypes.sizeof(MEMORYSTATUSEX)
-    ctypes.windll.kernel32.GlobalMemoryStatusEx(ctypes.byref(status))
+    kernel32 = ctypes.windll.kernel32
+    kernel32.GlobalMemoryStatusEx.argtypes = [ctypes.POINTER(MEMORYSTATUSEX)]
+    kernel32.GlobalMemoryStatusEx.restype = wintypes.BOOL
+    if not kernel32.GlobalMemoryStatusEx(ctypes.byref(status)):
+        raise OSError(kernel32.GetLastError(), "GlobalMemoryStatusEx failed")
     return int(status.ullTotalPhys), int(status.ullAvailPhys)
 
 
@@ -88,24 +92,38 @@ def cpu_count() -> int:
 
 def make_job(ram_bytes: int, cpu_pct: int):
     kernel32 = ctypes.windll.kernel32
+    kernel32.CreateJobObjectW.argtypes = [wintypes.LPVOID, wintypes.LPCWSTR]
+    kernel32.CreateJobObjectW.restype = wintypes.HANDLE
+    kernel32.SetInformationJobObject.argtypes = [
+        wintypes.HANDLE, wintypes.INT, wintypes.LPVOID, wintypes.DWORD]
+    kernel32.SetInformationJobObject.restype = wintypes.BOOL
+    kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
+    kernel32.CloseHandle.restype = wintypes.BOOL
+    kernel32.GetLastError.restype = wintypes.DWORD
     job = kernel32.CreateJobObjectW(None, None)
     if not job:
-        raise OSError("CreateJobObjectW failed")
+        raise OSError(kernel32.GetLastError(), "CreateJobObjectW failed")
     limits = JOBOBJECT_EXTENDED_LIMIT_INFORMATION()
     limits.BasicLimitInformation.LimitFlags = (
         JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE | JOB_OBJECT_LIMIT_JOB_MEMORY
         | JOB_OBJECT_LIMIT_PROCESS_MEMORY)
     limits.JobMemoryLimit = ram_bytes
     limits.ProcessMemoryLimit = ram_bytes
-    if not kernel32.SetInformationJobObject(job, 9, ctypes.byref(limits),
-                                            ctypes.sizeof(limits)):
-        raise OSError("SetInformationJobObject(JobMemoryLimit) failed")
-    if cpu_pct and cpu_pct < 100:
-        cpu = JOBOBJECT_CPU_RATE_CONTROL_INFORMATION()
-        cpu.ControlFlags = CPU_RATE_CONTROL_ENABLE_HARD_CAP
-        cpu.CpuRate = max(1, int(cpu_pct * 100))
-        kernel32.SetInformationJobObject(job, JOB_OBJECT_CPU_RATE_CONTROL_INFORMATION,
-                                         ctypes.byref(cpu), ctypes.sizeof(cpu))
+    try:
+        if not kernel32.SetInformationJobObject(job, 9, ctypes.byref(limits),
+                                                ctypes.sizeof(limits)):
+            raise OSError(kernel32.GetLastError(), "SetInformationJobObject(JobMemoryLimit) failed")
+        if cpu_pct < 100:
+            cpu = JOBOBJECT_CPU_RATE_CONTROL_INFORMATION()
+            cpu.ControlFlags = CPU_RATE_CONTROL_ENABLE_HARD_CAP
+            cpu.RateControl.CpuRate = max(1, int(cpu_pct * 100))
+            if not kernel32.SetInformationJobObject(
+                    job, JOB_OBJECT_CPU_RATE_CONTROL_INFORMATION,
+                    ctypes.byref(cpu), ctypes.sizeof(cpu)):
+                raise OSError(kernel32.GetLastError(), "SetInformationJobObject(CPU hard cap) failed")
+    except OSError:
+        kernel32.CloseHandle(job)
+        raise
     return job
 
 
@@ -115,6 +133,13 @@ def assign(job, pid: int) -> tuple[bool, int]:
     PROCESS_SET_QUOTA = 0x0100
     PROCESS_TERMINATE = 0x0001
     PROCESS_QUERY_INFORMATION = 0x0400
+    kernel32.OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
+    kernel32.OpenProcess.restype = wintypes.HANDLE
+    kernel32.AssignProcessToJobObject.argtypes = [wintypes.HANDLE, wintypes.HANDLE]
+    kernel32.AssignProcessToJobObject.restype = wintypes.BOOL
+    kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
+    kernel32.CloseHandle.restype = wintypes.BOOL
+    kernel32.GetLastError.restype = wintypes.DWORD
     handle = kernel32.OpenProcess(PROCESS_SET_QUOTA | PROCESS_TERMINATE | PROCESS_QUERY_INFORMATION,
                                    False, pid)
     if not handle:
@@ -125,14 +150,51 @@ def assign(job, pid: int) -> tuple[bool, int]:
     return ok, error
 
 
+def start_in_job(command: list[str], job, *, stdout, stderr):
+    process = subprocess.Popen(command, stdout=stdout, stderr=stderr,
+                               creationflags=CREATE_SUSPENDED)
+    try:
+        ok, error = assign(job, process.pid)
+    except BaseException:
+        process.kill()
+        process.wait()
+        raise
+    if not ok:
+        process.kill()
+        process.wait()
+        raise RuntimeError(
+            f"AssignProcessToJobObject failed with Win32 {error}; suspended workload was terminated"
+        )
+    ntdll = ctypes.windll.ntdll
+    ntdll.NtResumeProcess.argtypes = [wintypes.HANDLE]
+    ntdll.NtResumeProcess.restype = ctypes.c_long
+    try:
+        status = ntdll.NtResumeProcess(process._handle)
+    except BaseException:
+        process.kill()
+        process.wait()
+        raise
+    if status != 0:
+        process.kill()
+        process.wait()
+        raise RuntimeError(
+            f"NtResumeProcess returned {status}; suspended workload was terminated"
+        )
+    return process
+
+
 def job_peak(job) -> tuple[int, int]:
     """Пик памяти процесса в job и жёсткий лимит (байты)."""
     kernel32 = ctypes.windll.kernel32
+    kernel32.QueryInformationJobObject.argtypes = [
+        wintypes.HANDLE, wintypes.INT, wintypes.LPVOID, wintypes.DWORD, wintypes.LPVOID]
+    kernel32.QueryInformationJobObject.restype = wintypes.BOOL
+    kernel32.GetLastError.restype = wintypes.DWORD
     info = JOBOBJECT_EXTENDED_LIMIT_INFORMATION()
     ok = kernel32.QueryInformationJobObject(job, 9, ctypes.byref(info),
                                             ctypes.sizeof(info), None)
     if not ok:
-        return 0, 0
+        raise OSError(kernel32.GetLastError(), "QueryInformationJobObject failed")
     return int(info.PeakJobMemoryUsed), int(info.JobMemoryLimit)
 
 
@@ -154,11 +216,18 @@ def main() -> int:
     command = [part for part in args.command if part != "--"]
     if not command:
         parser.error("no command given")
+    if os.name != "nt":
+        parser.error("limited_run requires Windows Job Objects and is not supported on this platform")
+    if not 5 <= args.ram_pct <= 95:
+        parser.error("--ram-pct must be between 5 and 95")
+    if not 5 <= args.ram_free_pct <= 100:
+        parser.error("--ram-free-pct must be between 5 and 100")
+    if not 1 <= args.cpu_pct <= 100:
+        parser.error("--cpu-pct must be between 1 and 100")
     total, avail = total_physical_memory()
-    cap_total = int(total * max(5, min(95, args.ram_pct)) / 100)
-    cap_free = int(avail * max(5, min(100, args.ram_free_pct)) / 100)
+    cap_total = int(total * args.ram_pct / 100)
+    cap_free = int(avail * args.ram_free_pct / 100)
     cap = min(cap_total, cap_free)
-    job = make_job(cap, max(1, min(100, args.cpu_pct)))
     out = open(args.log, "ab", buffering=0) if args.log else None
     started = time.perf_counter()
 
@@ -172,45 +241,47 @@ def main() -> int:
         if out is not None:
             out.write((line + "\n").encode("utf-8"))
 
+    try:
+        job = make_job(cap, args.cpu_pct)
+    except OSError as exc:
+        report(f"[limited_run] failed to configure Job Object: {exc}")
+        if out is not None:
+            out.close()
+        return 3
     report(f"[limited_run] RAM cap {cap/1e9:.2f} ГБ "
            f"(min({args.ram_pct}% от {total/1e9:.1f} ГБ, {args.ram_free_pct}% от свободных "
            f"{avail/1e9:.1f} ГБ)), CPU cap {args.cpu_pct}% "
            f"({max(1, args.cpu_pct*cpu_count()//100)} из {cpu_count()} ядер)")
     try:
-        # Процесс создаётся ПРИОСТАНОВЛЕННЫМ: лимит памяти должен действовать
-        # с первого байта его адресного пространства, а не после первого
-        # размещения. Затем он назначается в job и только потом возобновляется.
-        process = subprocess.Popen(command, stdout=out or subprocess.DEVNULL,
-                                   stderr=subprocess.STDOUT if out else subprocess.DEVNULL,
-                                   creationflags=CREATE_SUSPENDED)
+        # The child remains suspended until the Job Object limits are active.
+        process = start_in_job(
+            command, job, stdout=out or subprocess.DEVNULL,
+            stderr=subprocess.STDOUT if out else subprocess.DEVNULL)
     except OSError as exc:
         report(f"[limited_run] failed to start: {exc}")
+        ctypes.windll.kernel32.CloseHandle(job)
+        if out is not None:
+            out.close()
         return 2
-    ok, error = assign(job, process.pid)
-    if not ok:
-        report(f"[limited_run] ВНИМАНИЕ: не удалось назначить job object (Win32 {error}) — "
-               "лимит памяти НЕ применён")
-        try:
-            ctypes.windll.ntdll.NtResumeProcess(process._handle)
-        except Exception:                                   # noqa: BLE001
-            process.kill()
-            return 3
-    else:
-        ntdll = ctypes.windll.ntdll
-        status = ntdll.NtResumeProcess(process._handle)
-        if status != 0:
-            report(f"[limited_run] NtResumeProcess вернул {status}")
-            process.kill()
-            return 3
-    code = process.wait()
-    elapsed = time.perf_counter() - started
-    peak, limit = job_peak(job)
-    report(f"[limited_run] завершился с кодом {code} за {elapsed/60:.1f} мин; "
-           f"пик памяти {peak/1e9:.2f} ГБ при лимите {limit/1e9:.2f} ГБ"
-           + ("  ← УБИТ ЛИМИТОМ ПАМЯТИ" if code != 0 and peak >= limit * 0.95 else ""))
-    if out:
-        out.close()
-    return code
+    except RuntimeError as exc:
+        report(f"[limited_run] {exc}")
+        ctypes.windll.kernel32.CloseHandle(job)
+        if out is not None:
+            out.close()
+        return 3
+
+    try:
+        code = process.wait()
+        elapsed = time.perf_counter() - started
+        peak, limit = job_peak(job)
+        report(f"[limited_run] завершился с кодом {code} за {elapsed/60:.1f} мин; "
+               f"пик памяти {peak/1e9:.2f} ГБ при лимите {limit/1e9:.2f} ГБ"
+               + ("  ← УБИТ ЛИМИТОМ ПАМЯТИ" if code != 0 and peak >= limit * 0.95 else ""))
+        return code
+    finally:
+        ctypes.windll.kernel32.CloseHandle(job)
+        if out is not None:
+            out.close()
 
 
 if __name__ == "__main__":

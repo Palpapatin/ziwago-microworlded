@@ -15,6 +15,7 @@ import datetime
 import gc
 import gzip
 import json
+import logging
 import math
 import os
 from pathlib import Path
@@ -116,6 +117,17 @@ class SixDialogCorporaStreamer:
         )
         self._cornell_helper = PairedDialogueStreamer(root=root)
         self._cursors: Dict[str, int] = {k: 0 for k in self.ALL_SOURCES}
+        self._parse_rejections: Dict[str, Dict[str, int]] = {}
+
+    def _record_parse_rejection(self, source: str, line_number: int, exc: Exception) -> None:
+        reasons = self._parse_rejections.setdefault(source, {})
+        error_type = type(exc).__name__
+        reasons[error_type] = reasons.get(error_type, 0) + 1
+        if reasons[error_type] == 1:
+            logging.getLogger(__name__).warning(
+                "Skipped malformed %s record at line %d (%s: %s); total is included in stream counts.",
+                source, line_number, error_type, exc,
+            )
 
     def _sample_ultrachat(self, n_pairs: int) -> List[Tuple[str, str, str, float]]:
         uc_dir = self.dialog_dir / "ultrachat" / "data"
@@ -178,7 +190,8 @@ class SixDialogCorporaStreamer:
                     tree = json.loads(ln)
                     if "prompt" in tree:
                         _extract_tree_pairs(tree["prompt"])
-                except Exception:
+                except Exception as exc:
+                    self._record_parse_rejection("oasst2", l_i + 1, exc)
                     continue
                 if len(out) >= n_pairs:
                     break
@@ -237,7 +250,8 @@ class SixDialogCorporaStreamer:
                                 out.append(("personamem", ca, cb, 1.20))
                                 if len(out) >= n_pairs:
                                     return out
-                except Exception:
+                except Exception as exc:
+                    self._record_parse_rejection("personamem", l_i + 1, exc)
                     continue
             else:
                 self._cursors["personamem"] = 0
@@ -265,7 +279,8 @@ class SixDialogCorporaStreamer:
                                 out.append(("npc_dialogue", ca, cb, 1.10))
                                 if len(out) >= n_pairs:
                                     return out
-                except Exception:
+                except Exception as exc:
+                    self._record_parse_rejection("npc_dialogue", l_i + 1, exc)
                     continue
             else:
                 self._cursors["npc_dialogue"] = 0
@@ -304,6 +319,11 @@ class SixDialogCorporaStreamer:
                 pairs_out.append(TokenizedDialogPair(src, ids_a, ids_b, q_h))
                 counts[src] = counts.get(src, 0) + 1
 
+        for source, reasons in self._parse_rejections.items():
+            for error_type, count in reasons.items():
+                counts[f"rejected_{source}_{error_type}"] = count
+        for error_type, count in self._cornell_helper.rejection_counts().items():
+            counts[f"rejected_cornell_{error_type}"] = count
         return pairs_out, counts, round(time.perf_counter() - t0, 3)
 
 

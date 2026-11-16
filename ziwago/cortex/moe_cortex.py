@@ -511,7 +511,7 @@ ight) = \sin\!\Big(	ilde{\phi}_j(t) - 	ilde{\phi}_i(t - 	au_{ij})\Big)$$
         saved_lag_dwpli = self.last_lag_dwpli
 
         try:
-            test_rates = torch.tensor([0.12, 0.04, 0.18, 0.02, 0.15, 0.05, 0.09, 0.11])
+            test_rates = torch.linspace(0.02, 0.18, self.n_columns)
             mat_ref0 = self.step_phases_and_compute_causal_matrix(
                 test_rates, common_reference_offset=0.0)
             dwpli_ref0 = self.last_lag_dwpli
@@ -1297,7 +1297,8 @@ class SparselyGatedCorticalMoE:
                 if cid not in active_ids:
                     zero_post = torch.zeros_like(col.pyr.v_s)
                     col._advance_synaptic_clock(torch.zeros_like(x_in), zero_post,
-                                                zero_post, zero_post)
+                                                zero_post, zero_post,
+                                                decay_weights=learn)
                     col.tick_ladder.tick = self.global_clock_tick - 1
                     col.tick_ladder.step(is_sleep_tick=is_sleep_tick,
                                          lambda_atp=col._mod_ctx["lambda_atp"])

@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import ast
 import json
+import logging
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, List, Optional
@@ -46,7 +47,11 @@ class PairedDialogueStreamer:
 
         self._cornell_lines_map: Dict[str, str] = {}
         self._cornell_conv_cursor: int = 0
+        self._parse_rejections: Dict[str, int] = {}
         self._load_cornell_lines_index()
+
+    def rejection_counts(self) -> Dict[str, int]:
+        return dict(self._parse_rejections)
 
     def _encode(self, text: str) -> List[int]:
         assert _gpt2_mod._WORKER_VOCAB is not None and _gpt2_mod._WORKER_MERGES is not None
@@ -110,7 +115,15 @@ class PairedDialogueStreamer:
                         continue
                     try:
                         lids = ast.literal_eval(parts[3])
-                    except Exception:
+                    except (SyntaxError, ValueError, TypeError) as exc:
+                        reason = type(exc).__name__
+                        self._parse_rejections[reason] = self._parse_rejections.get(reason, 0) + 1
+                        if self._parse_rejections[reason] == 1:
+                            logging.getLogger(__name__).warning(
+                                "Skipped malformed Cornell conversation at line %d (%s: %s); "
+                                "total is included in stream counts.",
+                                line_idx + 1, reason, exc,
+                            )
                         continue
                     for a_id, b_id in zip(lids, lids[1:]):
                         ua = self._cornell_lines_map.get(str(a_id))

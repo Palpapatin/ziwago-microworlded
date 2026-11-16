@@ -22,12 +22,12 @@ import mmap
 import os
 import sys
 import tempfile
+import threading
 from contextlib import contextmanager
 from pathlib import Path
 from typing import Callable, Dict, List, Optional, Sequence, Tuple
 
 import torch
-import torch.nn.functional as F
 
 ROOT = Path(__file__).resolve().parent.parent
 if str(ROOT) not in sys.path:
@@ -63,6 +63,20 @@ from ziwago.organism.verified import (
 
 
 V20_SCHEMA = "ziwago.checkpoint.v20.0"
+_READONLY_CHECKPOINT_MAPPING_LOCK = threading.RLock()
+
+
+class CandidatePublishError(RuntimeError):
+    pass
+
+
+def _link_candidate_temp(temp: Path, destination: Path) -> None:
+    try:
+        os.link(temp, destination)
+    except OSError as exc:
+        raise CandidatePublishError(
+            f"Could not publish candidate at {destination}; complete checkpoint retained at {temp}"
+        ) from exc
 
 
 @contextmanager
@@ -78,22 +92,24 @@ def _readonly_checkpoint_mapping():
     Python mmap.ACCESS_READ даёт настоящую file-backed PAGE_READONLY-страницу
     (evictable, ~0 commit). torch.frombuffer разделяет память без копии и удерживает
     буфер живым через DataPtr, поэтому отображение переживает выход из контекста.
-    Подмена from_file ограничена окном загрузки и всегда восстанавливается.
+    Вызовы загрузчика сериализованы; подмена from_file восстанавливается после
+    torch.load. Не запускайте посторонний torch.load параллельно с restore.
     """
-    original = torch.UntypedStorage.from_file
-    keepalive = []
+    with _READONLY_CHECKPOINT_MAPPING_LOCK:
+        original = torch.UntypedStorage.from_file
+        keepalive = []
 
-    def _from_file(filename, shared, size):
-        handle = open(filename, "rb")
-        mapping = mmap.mmap(handle.fileno(), size, access=mmap.ACCESS_READ)
-        keepalive.append((handle, mapping))
-        return torch.frombuffer(mapping, dtype=torch.uint8).untyped_storage()
+        def _from_file(filename, shared, size):
+            with open(filename, "rb") as handle:
+                mapping = mmap.mmap(handle.fileno(), size, access=mmap.ACCESS_READ)
+            keepalive.append(mapping)
+            return torch.frombuffer(mapping, dtype=torch.uint8).untyped_storage()
 
-    torch.UntypedStorage.from_file = _from_file
-    try:
-        yield
-    finally:
-        torch.UntypedStorage.from_file = original
+        torch.UntypedStorage.from_file = _from_file
+        try:
+            yield
+        finally:
+            torch.UntypedStorage.from_file = original
 
 
 class ZiwagoOrganism:
@@ -247,11 +263,17 @@ class ZiwagoOrganism:
         result = self.core_organism.train_wave_with_neuromodulator_reward(pairs, wave_idx=wave_idx)
         registered = 0
         schemas_added = 0
-        for pair in pairs:
+        decode_errors = []
+        for pair_index, pair in enumerate(pairs):
             try:
                 stim_text = self.core_organism.decode_tokens(list(pair.stimulus_ids))
                 resp_text = self.core_organism.decode_tokens(list(pair.response_ids))
-            except Exception:  # noqa: BLE001 — декодирование не должно ронять обучение
+            except Exception as exc:  # noqa: BLE001 — failure is retained in wave telemetry
+                decode_errors.append({
+                    "pair_index": pair_index,
+                    "error_type": type(exc).__name__,
+                    "error": str(exc),
+                })
                 continue
             if not stim_text or not resp_text:
                 continue
@@ -263,6 +285,7 @@ class ZiwagoOrganism:
                 registered += len(disc)
         result["role_bindings_registered"] = registered
         result["schema_records_added"] = schemas_added
+        result["role_pair_decode_errors"] = decode_errors
         result["role_map_size"] = len(self.core_organism.role_filler_binder.dynamic_stdp_role_map)
         return result
 
@@ -403,15 +426,23 @@ class ZiwagoOrganism:
             family = str(getattr(edge, "source", "") or "world").split("|")[0]
             families.setdefault(family, []).append(edge)
         registered = 0
-        for family in sorted(families)[:max_graphs]:
+        selected_families = sorted(families, key=lambda family: (-len(families[family]), family))
+        skipped_families = max(0, len(selected_families) - max_graphs)
+        edge_cap_rejections = 0
+        registration_rejections = 0
+        for family in selected_families[:max_graphs]:
             family_edges = families[family]
             if len(family_edges) < 2:
                 continue
             node_types: Dict[str, str] = {}
             dream_edges = []
-            for edge in family_edges[:max_nodes]:
+            for edge in family_edges:
                 subject = str(edge.subject)
                 target = str(edge.target)
+                new_nodes = {subject, target} - node_types.keys()
+                if len(node_types) + len(new_nodes) > max_nodes:
+                    edge_cap_rejections += 1
+                    continue
                 node_types[subject] = str(getattr(edge, "subject_type", "entity") or "entity")
                 node_types[target] = str(getattr(edge, "target_type", "entity") or "entity")
                 dream_edges.append({
@@ -420,13 +451,13 @@ class ZiwagoOrganism:
                     "causal_kind": str(getattr(edge, "causal_kind", "association")),
                     "type": "association",
                 })
-            if len(node_types) > max_nodes:
+            if len(dream_edges) < 2:
                 continue
             try:
                 dreamer.register_graph(family, dream_edges, node_types)
                 registered += 1
             except ValueError:
-                continue
+                registration_rejections += 1
         analogies = []
         names = sorted(dreamer.graphs)[:max_graphs]
         pairs = 0
@@ -439,7 +470,10 @@ class ZiwagoOrganism:
                 if match and not match.get("ambiguous"):
                     analogies.append({"source": source, "target": target,
                                        "mapping": match["mapping"], "score": match["score"]})
-        return {"graphs_registered": registered, "pairs_compared": pairs,
+        return {"graphs_registered": registered, "families_skipped_by_graph_cap": skipped_families,
+                "edges_skipped_by_node_cap": edge_cap_rejections, "node_cap": max_nodes,
+                "graph_registration_rejections": registration_rejections,
+                "pairs_compared": pairs,
                 "analogies_found": len(analogies), "analogies": analogies[:8]}
 
     def _register_foundation_sources(self) -> None:
@@ -519,6 +553,8 @@ class ZiwagoOrganism:
             "grounded": bool(grounded),
             "reason": "grounded_answer",
             "role_dictionary_size": 0,
+            "role_slot_mapping": {},
+            "unmapped_roles": [],
             "prompt": prompt,
         }
         if grounded:
@@ -537,19 +573,30 @@ class ZiwagoOrganism:
 
         slot_names = self.content_form_composer.ROLE_SLOT_NAMES[:self.content_form_composer.multiplexer.n_gamma_slots]
         canonical_vocab: Dict[str, Dict[str, torch.Tensor]] = {}
+        role_slot_mapping = {}
+        unmapped_roles = set()
         for idx, role in enumerate(sorted(vocab.keys())):
-            slot_name = slot_names[idx % len(slot_names)]
+            if idx >= len(slot_names):
+                unmapped_roles.add(role)
+                continue
+            slot_name = slot_names[idx]
             canonical_vocab[slot_name] = dict(vocab[role])
+            role_slot_mapping[role] = slot_name
 
         fillers: List[RoleFiller] = []
-        for idx, (role, label) in enumerate(sorted(bindings.items())):
+        for role, label in sorted(bindings.items()):
             vec = vocab.get(role, {}).get(label)
             if vec is None:
                 continue
-            slot_name = slot_names[idx % len(slot_names)]
+            slot_name = role_slot_mapping.get(role)
+            if slot_name is None:
+                unmapped_roles.add(role)
+                continue
             fillers.append(RoleFiller(role=slot_name, label=label, vector=vec, source="learned_role_map"))
+        report["role_slot_mapping"] = role_slot_mapping
+        report["unmapped_roles"] = sorted(unmapped_roles)
         if not fillers:
-            report["reason"] = "role_vector_missing"
+            report["reason"] = "role_slot_limit_exceeded" if unmapped_roles else "role_vector_missing"
             return report
 
         def _render(mapping: Dict[str, str]) -> str:
@@ -851,13 +898,19 @@ class ZiwagoOrganism:
         fd, temporary = tempfile.mkstemp(prefix=".v20-", suffix=".pt", dir=path.parent)
         os.close(fd)
         temp = Path(temporary)
+        preserve_temp = False
         try:
             torch.save(payload, temp)
             with temp.open("r+b") as stream:
                 os.fsync(stream.fileno())
-            os.link(temp, path)
+            try:
+                _link_candidate_temp(temp, path)
+            except CandidatePublishError:
+                preserve_temp = True
+                raise
         finally:
-            temp.unlink(missing_ok=True)
+            if not preserve_temp:
+                temp.unlink(missing_ok=True)
         return {"path": str(path), "sha256": file_sha256(path), "schema": V20_SCHEMA, "accepted": False}
 
     def _save_candidate_legacy(self, path: Path, extra_metadata: Optional[dict] = None, use_fp16: bool = False) -> dict:
@@ -877,6 +930,7 @@ class ZiwagoOrganism:
         os.close(fd)
         temp = Path(temporary)
         previous_path = self.core_organism.loaded_checkpoint_path
+        preserve_temp = False
         try:
             payload, _ = self.core_organism.export_checkpoint_payload(use_fp16=use_fp16)
             payload["core_runtime_state"]["core"]["loaded_checkpoint_path"] = str(path)
@@ -886,10 +940,15 @@ class ZiwagoOrganism:
             torch.save(payload, temp)
             with temp.open("r+b") as stream:
                 os.fsync(stream.fileno())
-            os.link(temp, path)
+            try:
+                _link_candidate_temp(temp, path)
+            except CandidatePublishError:
+                preserve_temp = True
+                raise
         finally:
             self.core_organism.loaded_checkpoint_path = previous_path
-            temp.unlink(missing_ok=True)
+            if not preserve_temp:
+                temp.unlink(missing_ok=True)
         return {"path": str(path), "sha256": file_sha256(path), "schema": V19_SCHEMA, "accepted": False}
 
     def _load_v20_payload(self, path, payload):

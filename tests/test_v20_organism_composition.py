@@ -189,11 +189,7 @@ class FlatV20Tests(unittest.TestCase):
     def test_generation_v20(self):
         flat = build_flat(integrated=True)
         prompt = "What neurons integrate sensory signals?"
-        try:
-            out = flat.generate_response(prompt, max_tokens=12)
-        except Exception:
-            # малый организм может не поддерживать полную генерацию
-            return
+        out = flat.generate_response(prompt, max_tokens=12)
         self.assertIn("pure_weight_generated_response", out)
 
     def test_evaluation_context_restores_state(self):
@@ -265,6 +261,54 @@ class UnifiedContourTests(unittest.TestCase):
             self.assertIsNone(payload.get("v19_schema_version"))
         self.assertEqual(flat.core_organism.loaded_checkpoint_path, "",
                          "save must restore loaded_checkpoint_path (finally block)")
+
+    def test_candidate_publish_failure_preserves_complete_temp_file(self):
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as tmp:
+            temp = Path(tmp) / ".candidate.pt"
+            destination = Path(tmp) / "candidate.pt"
+            temp.write_bytes(b"complete checkpoint")
+            with mock.patch.object(flatmod.os, "link", side_effect=OSError("hardlinks unavailable")):
+                with self.assertRaisesRegex(flatmod.CandidatePublishError, "retained at"):
+                    flatmod._link_candidate_temp(temp, destination)
+            self.assertTrue(temp.is_file())
+            self.assertEqual(temp.read_bytes(), b"complete checkpoint")
+            self.assertFalse(destination.exists())
+
+    def test_readonly_checkpoint_mapping_restores_torch_hook_and_releases_file(self):
+        import gc
+        import tempfile
+
+        original = torch.UntypedStorage.from_file
+        with tempfile.TemporaryDirectory() as tmp:
+            checkpoint = Path(tmp) / "small.pt"
+            torch.save({"weights": torch.arange(16)}, checkpoint)
+            with flatmod._readonly_checkpoint_mapping():
+                payload = torch.load(
+                    checkpoint, map_location="cpu", weights_only=True, mmap=True)
+            self.assertIs(torch.UntypedStorage.from_file, original)
+            mapped = payload["weights"]
+            self.assertTrue(torch.equal(mapped, torch.arange(16)))
+            from ziwago.cortex.moe_cortex import load_runtime_tree
+
+            current = torch.zeros_like(mapped)
+            reused = load_runtime_tree(current, mapped, _reuse_current_tensors=True)
+            cloned = load_runtime_tree(None, mapped)
+            self.assertIs(reused, current)
+            self.assertNotEqual(reused.data_ptr(), mapped.data_ptr())
+            self.assertNotEqual(cloned.data_ptr(), mapped.data_ptr())
+            current[0] = -1
+            cloned[1] = -1
+            self.assertEqual(mapped[0].item(), 0)
+            self.assertEqual(mapped[1].item(), 1)
+            payload = None
+            mapped = None
+            reused = None
+            cloned = None
+            current = None
+            gc.collect()
+            checkpoint.unlink()
 
 
 if __name__ == "__main__":

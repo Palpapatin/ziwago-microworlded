@@ -14,7 +14,7 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from ziwago.config import USSynapseCfg
-from ziwago.core.synapse import GenesisSynapse
+from ziwago.core.synapse import GenesisSynapse, SCAFFOLD_PLASTIC
 from ziwago.cortex import moe_cortex as runtime_paths
 from ziwago.cortex.moe_cortex import SparselyGatedCorticalMoE
 
@@ -182,6 +182,17 @@ def test_routing_telemetry_restores_router_state_even_after_second_sweep():
     _assert_tree_equal(before, cortex.export_state_dict())
 
 
+def test_routing_telemetry_supports_sixteen_columns():
+    cortex = SparselyGatedCorticalMoE(
+        n_columns=16, neurons_per_column=32, n_in=32, seed=20,
+    )
+
+    report = cortex.routing_telemetry()
+
+    assert report["total_columns"] == 16
+    assert report["reference_sweep_invariance_check"]["is_reference_invariant"]
+
+
 @pytest.mark.parametrize("fault", ["tick", "dt"])
 def test_context_clock_validation_precedes_all_mutation(fault):
     cortex = _moe()
@@ -206,6 +217,9 @@ def test_global_local_ticks_and_all_synapses_advance_through_dormancy():
         col.tick_ladder.tick = 3  # stale local clock must align, not increment to 4
         col.pyr.theta.fill_(-100.0)  # ensure a real measured post-activity signal
         for syn in (col.w_ff, col.w_rec, col.w_fb):
+            plastic = syn.scaffold_state == SCAFFOLD_PLASTIC
+            syn.w_slow[plastic] = 0.4
+            syn.w_fast[plastic] = 0.2
             syn.tag.fill_(1.0)
             syn.eligibility.fill_(0.5)
     x = torch.full((32,), 0.25)
@@ -213,10 +227,21 @@ def test_global_local_ticks_and_all_synapses_advance_through_dormancy():
     for elapsed, active in enumerate(schedule, 1):
         tick = 40 + elapsed
         ctx = _context(tick, is_sleep_tick=(elapsed == 5))
+        dormant_synapses = (
+            cortex.columns[1 - active].w_ff,
+            cortex.columns[1 - active].w_rec,
+            cortex.columns[1 - active].w_fb,
+        )
+        dormant_weights = [
+            (syn.w_slow.clone(), syn.w_fast.clone()) for syn in dormant_synapses
+        ]
         with patch.object(cortex.columns[active].minicolumn_hierarchy, "update_tiers",
                           wraps=cortex.columns[active].minicolumn_hierarchy.update_tiers) as tiers:
             out = cortex.step(x, learn=False, organism_context=ctx, routing_bias=_bias(active))
         assert out.active_expert_ids == [active]
+        for syn, (slow_before, fast_before) in zip(dormant_synapses, dormant_weights):
+            assert torch.equal(syn.w_slow, slow_before)
+            assert torch.equal(syn.w_fast, fast_before)
         assert cortex.global_clock_tick == tick
         assert tiers.call_args.kwargs["ladder_step"].tick == tick
         assert tiers.call_args.kwargs["ladder_step"].run_class_4_sleep == ctx["is_sleep_tick"]

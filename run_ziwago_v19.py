@@ -5,8 +5,10 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import os
 from pathlib import Path
 import sys
+import tempfile
 import time
 
 from ziwago.evaluation.gates import (
@@ -16,6 +18,27 @@ from train_ziwago_v14_pure_synaptic_dialogue import TokenizedDialogPair
 from ziwago.organism_core import ROOT
 from ziwago.organism.verified import accept_candidate, file_sha256, stable_hash
 from ziwago_assistant import ZiwagoBiologicalSNNAssistant
+
+
+def _write_json_atomic(path: Path, payload: dict) -> None:
+    path = Path(path)
+    fd, temporary = tempfile.mkstemp(prefix=f".{path.name}.", suffix=".tmp", dir=path.parent)
+    temp_path = Path(temporary)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as stream:
+            json.dump(payload, stream, ensure_ascii=False, indent=2)
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(temp_path, path)
+    except BaseException:
+        temp_path.unlink(missing_ok=True)
+        raise
+
+
+def _accepted_checkpoint_path(output_dir: Path, runtime_version: int) -> Path:
+    if runtime_version not in (19, 20):
+        raise ValueError(f"Unsupported runtime version: {runtime_version}")
+    return Path(output_dir) / "checkpoints" / f"ziwago_v{runtime_version}_0_accepted.pt"
 
 
 def load_splits(dataset: Path, acceptance: Path, acceptance_mode: str = "closed_book", *,
@@ -94,7 +117,7 @@ def evaluate_frozen_acceptance(assistant, train: list[dict], cases: list[dict], 
 
     known_records = [item for item in train + assistant.genesis.authority.records + assistant.organism.language_memory_records
                      if item.get("split", "train") == "train"]
-    ranker_metadata = acceptance_ranker_metadata(assistant.genesis)
+    ranker_metadata = acceptance_ranker_metadata(assistant.genesis, mode)
     ranker_families = {family for key in ("fit_family_ids", "internal_dev_family_ids", "calibration_family_ids")
                        for family in ranker_metadata.get(key, [])}
     known_families = {item.get("family_id") for item in known_records if item.get("family_id")} | ranker_families
@@ -275,7 +298,7 @@ def run_training(dataset: Path, acceptance: Path, output_dir: Path = ROOT / "Pro
     progress = {"version": f"{runtime_version}.0", "stage": "baseline_measured",
                 "source_hashes": source_hashes, "diagnostics": diagnostics}
     progress.update(physiology_report())
-    progress_path.write_text(json.dumps(progress, ensure_ascii=False, indent=2), encoding="utf-8")
+    _write_json_atomic(progress_path, progress)
     print(json.dumps({"stage": "baseline_measured", "progress_path": str(progress_path)}, ensure_ascii=False), flush=True)
     for epoch in range(epochs):
         for item in train:
@@ -356,7 +379,7 @@ def run_training(dataset: Path, acceptance: Path, output_dir: Path = ROOT / "Pro
                          "last_sleep": {k: v for k, v in epoch_sleep.items() if k != "rem"},
                          "rem": epoch_sleep.get("rem"),
                          "learning_counts": learning_counts})
-        progress_path.write_text(json.dumps(progress, ensure_ascii=False, indent=2), encoding="utf-8")
+        _write_json_atomic(progress_path, progress)
         print(json.dumps({"stage": "epoch_finished", "epoch": epoch + 1, "learning_counts": learning_counts}), flush=True)
     diagnostics["after"] = {"train": measure_language_diagnostics(assistant, train, "train"),
                              "heldout": measure_language_diagnostics(assistant, cases, "heldout")}
@@ -395,15 +418,15 @@ def run_training(dataset: Path, acceptance: Path, output_dir: Path = ROOT / "Pro
               "sleep_telemetry": sleep_telemetry,
               "progress_path": str(progress_path)}
     if promote:
-        result["promotion"] = accept_candidate(candidate_path, report,
-                                                output_dir / "checkpoints/ziwago_v19_0_accepted.pt")
+        result["promotion"] = accept_candidate(
+            candidate_path, report, _accepted_checkpoint_path(output_dir, runtime_version))
     report_path = output_dir / f"v{runtime_version}_acceptance_{time.time_ns()}.json"
     result["report_path"] = str(report_path)
     with report_path.open("x", encoding="utf-8") as stream:
         json.dump(result, stream, indent=2, ensure_ascii=False)
     progress.update({"stage": "completed", "report_path": str(report_path), "candidate_sha256": saved["sha256"],
                      "acceptance_passed": bool(report.get("passed"))})
-    progress_path.write_text(json.dumps(progress, ensure_ascii=False, indent=2), encoding="utf-8")
+    _write_json_atomic(progress_path, progress)
     return result
 
 

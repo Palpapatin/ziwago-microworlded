@@ -56,5 +56,5 @@ def report(label):
 
 
 report("ORIGINAL")
-ToroidalRelationAttractor._recurrent_drive = corrected_drive
+ToroidalRelationAttractor.recurrent_drive = corrected_drive
 report("CORRECTED")

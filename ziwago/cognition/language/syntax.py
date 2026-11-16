@@ -5,6 +5,7 @@
 initialize_synaptic_connectors, глобальных связей с v14 нет.
 """
 
+import logging
 from typing import Dict, List, Optional, Tuple
 
 import torch
@@ -227,9 +228,17 @@ class BA44AttractorSyntaxBridge:
             for tid in stimulus_ids:
                 try:
                     v = torch.as_tensor(get_vec64_fn(int(tid))).detach().to(dtype=w.dtype, device=w.device).reshape(-1)
-                except Exception:
+                except (IndexError, KeyError, RuntimeError, TypeError, ValueError) as exc:
+                    logging.getLogger(__name__).warning(
+                        "Skipped BA44 stimulus token %s because its vector lookup failed (%s: %s).",
+                        tid, type(exc).__name__, exc,
+                    )
                     continue
                 if int(v.numel()) != self.d_vec:
+                    logging.getLogger(__name__).warning(
+                        "Skipped BA44 stimulus token %s with vector size %d; expected %d.",
+                        tid, int(v.numel()), self.d_vec,
+                    )
                     continue
                 acc = acc + v
                 n_used += 1

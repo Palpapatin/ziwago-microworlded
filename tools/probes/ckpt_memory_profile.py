@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Profile checkpoint tensor layout without loading, or measure production restore.
+"""Profile checkpoint tensor layout without loading, or measure production v19 restore.
 
 The default mode reads only pickle metadata. ``--restore`` uses the production
 READONLY-mmap loader and is refused unless at least 10 GB of physical RAM is free.
@@ -10,7 +10,6 @@ import argparse
 import gc
 import json
 import sys
-import threading
 import threading
 import time
 from pathlib import Path
@@ -95,7 +94,7 @@ def _private_gb(process) -> float:
     return float(process.memory_full_info().uss) / 1e9
 
 
-def _runtime_restore(checkpoint: Path) -> dict[str, Any]:
+def _runtime_restore(checkpoint: Path, expected_sha256: str) -> dict[str, Any]:
     import psutil
     import torch
 
@@ -147,27 +146,30 @@ def _runtime_restore(checkpoint: Path) -> dict[str, Any]:
     monitor.start()
     started = time.perf_counter()
     organism = None
-    payload = None
     try:
         organism = ZiwagoOrganism(root=ROOT, workers=2, cpu_threads=4, seed=42,
                                   auto_load_checkpoint=False, integrated=False)
         after_construct = _private_gb(process)
-        payload = organism._load_checkpoint_payload(checkpoint)
-        after_mapping = _private_gb(process)
-        organism._load_v19_payload(checkpoint, payload)
-        after_restore = _private_gb(process)
-        del payload
-        payload = None
+
+        phase_memory = {"after_mapping": None, "after_restore": None}
+
+        def consume(payload):
+            phase_memory["after_mapping"] = _private_gb(process)
+            organism._load_v19_payload(checkpoint, payload)
+            phase_memory["after_restore"] = _private_gb(process)
+
+        organism._consume_checkpoint_payload(checkpoint, expected_sha256, consume)
         gc.collect()
         torch._C._host_emptyCache()
         after_release = _private_gb(process)
         return {
-            "mode": "production_restore",
+            "mode": "production_v19_restore",
             "checkpoint": str(checkpoint),
+            "expected_sha256": expected_sha256,
             "free_ram_before_gb": round(available_gb, 3),
             "private_after_construct_gb": round(after_construct, 3),
-            "private_after_readonly_mapping_gb": round(after_mapping, 3),
-            "private_after_restore_gb": round(after_restore, 3),
+            "private_after_readonly_mapping_gb": round(phase_memory["after_mapping"], 3),
+            "private_after_restore_gb": round(phase_memory["after_restore"], 3),
             "private_after_payload_release_gb": round(after_release, 3),
             "peak_private_gb": round(peaks["private_gb"], 3),
             "peak_uss_gb": round(peaks["uss_gb"], 3),
@@ -183,8 +185,6 @@ def _runtime_restore(checkpoint: Path) -> dict[str, Any]:
         if "monitor" in locals():
             monitor.join(timeout=1.0)
         flat.load_runtime_tree = original_tree
-        if payload is not None:
-            del payload
         del organism
         gc.collect()
 
@@ -192,13 +192,16 @@ def _runtime_restore(checkpoint: Path) -> dict[str, Any]:
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--checkpoint", type=Path, required=True)
+    parser.add_argument("--sha256", help="expected checkpoint SHA-256 (required with --restore)")
     parser.add_argument("--restore", action="store_true",
-                        help="also construct and restore the production organism")
+                        help="also construct and restore the production v19 organism")
     parser.add_argument("--out", type=Path, help="write JSON report to this path")
     args = parser.parse_args()
+    if args.restore and not args.sha256:
+        parser.error("--restore requires --sha256")
     result = _layout(args.checkpoint)
     if args.restore:
-        result["restore"] = _runtime_restore(args.checkpoint)
+        result["restore"] = _runtime_restore(args.checkpoint, args.sha256)
 
     rendered = json.dumps(result, indent=2, ensure_ascii=False)
     print(rendered)
